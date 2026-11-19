@@ -2,12 +2,20 @@ from difflib import SequenceMatcher
 import json
 from pathlib import Path
 import re
+import threading
+import time
+import urllib.parse
+import urllib.request
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 app = FastAPI(title="Investment Score API")
 
 DATA_FILE = Path(__file__).parent / "stocks_tr.json"
+QUOTE_CACHE_TTL_SECONDS = 60
+
+_quote_cache: dict[str, tuple[float, dict]] = {}
+_quote_cache_lock = threading.Lock()
 
 
 def load_stocks() -> list[dict]:
@@ -68,6 +76,63 @@ def similarity_score(query_norm: str, stock: dict) -> float:
                 ratio = max(ratio, SequenceMatcher(None, query_norm, token).ratio())
             best = max(best, ratio * 0.8)
     return best
+
+
+def _fetch_yahoo_quote(ticker: str) -> dict:
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        raise ValueError("Leerer Ticker")
+
+    encoded = urllib.parse.quote(clean_ticker)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1m&range=1d"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise ValueError(chart["error"].get("description") or "Ticker nicht gefunden")
+
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError(f"Keine Kursdaten für '{clean_ticker}' gefunden")
+
+    meta = results[0].get("meta") or {}
+    price = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    currency = meta.get("currency") or "USD"
+    market_time = meta.get("regularMarketTime")
+
+    if price is None:
+        raise ValueError(f"Kein aktueller Kurs für '{clean_ticker}' verfügbar")
+
+    price_val = float(price)
+    prev_val = float(prev_close) if prev_close is not None else None
+    change = round(price_val - prev_val, 4) if prev_val is not None else None
+    change_percent = (
+        round(((price_val - prev_val) / prev_val) * 100.0, 2)
+        if prev_val not in (None, 0.0)
+        else None
+    )
+
+    return {
+        "ticker": clean_ticker,
+        "price": round(price_val, 4),
+        "previous_close": round(prev_val, 4) if prev_val is not None else None,
+        "change": change,
+        "change_percent": change_percent,
+        "currency": currency,
+        "market_timestamp": market_time,
+        "delayed_note": "Kursdaten können je nach Börse/Quelle leicht verzögert sein",
+        "cached": False,
+    }
 
 
 @app.get("/")
@@ -145,6 +210,36 @@ def search_stocks(
         "results": combined,
         "suggestions": alt_suggestions[:limit] if not matches else alt_suggestions[: max(0, limit - len(matches))],
     }
+
+
+@app.get("/quote")
+def get_quote(ticker: str = Query(..., min_length=1, description="Ticker-Symbol, z. B. AAPL oder SAP.DE")):
+    clean_ticker = ticker.strip().upper()
+    now = time.time()
+
+    with _quote_cache_lock:
+        cached = _quote_cache.get(clean_ticker)
+        if cached and (now - cached[0]) < QUOTE_CACHE_TTL_SECONDS:
+            data = dict(cached[1])
+            data["cached"] = True
+            return data
+
+    try:
+        quote_data = _fetch_yahoo_quote(clean_ticker)
+    except Exception as exc:
+        with _quote_cache_lock:
+            stale = _quote_cache.get(clean_ticker)
+            if stale:
+                fallback = dict(stale[1])
+                fallback["cached"] = True
+                fallback["stale"] = True
+                return fallback
+        raise HTTPException(status_code=502, detail=f"Kursabruf fehlgeschlagen: {exc}") from exc
+
+    with _quote_cache_lock:
+        _quote_cache[clean_ticker] = (now, quote_data)
+
+    return quote_data
 
 
 @app.get("/stocks/{identifier}")
