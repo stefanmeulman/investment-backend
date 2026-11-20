@@ -221,8 +221,11 @@ def _call_gemini_json(prompt: str) -> dict:
         raise RuntimeError("GEMINI_API_KEY ist auf dem Server nicht gesetzt")
 
     primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
-    fallback_model = "gemini-3.8-flash"
-    models_to_try = [primary_model] if primary_model == fallback_model else [primary_model, fallback_model]
+    fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
+
+    models_to_try: list[str] = [primary_model]
+    if fallback_model and fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -234,6 +237,7 @@ def _call_gemini_json(prompt: str) -> dict:
 
     raw_body: dict | None = None
     last_error_msg = "Unbekannter LLM-Fehler"
+    backoff_seconds = [1.5, 3.0, 6.0]
 
     for model_name in models_to_try:
         url = (
@@ -241,7 +245,7 @@ def _call_gemini_json(prompt: str) -> dict:
             f"{urllib.parse.quote(model_name)}:generateContent?key={urllib.parse.quote(api_key)}"
         )
 
-        for attempt in range(2):
+        for attempt, wait_sec in enumerate(backoff_seconds):
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
@@ -255,16 +259,16 @@ def _call_gemini_json(prompt: str) -> dict:
             except urllib.error.HTTPError as err:
                 detail_body = err.read().decode("utf-8", errors="replace")
                 if err.code == 429:
-                    raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
+                    raise RuntimeError("Gemini Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
                 last_error_msg = f"Gemini HTTP {err.code} ({model_name}): {detail_body[:250]}"
-                if err.code == 503 and attempt == 0:
-                    time.sleep(2.0)
+                if err.code == 503 and attempt < len(backoff_seconds) - 1:
+                    time.sleep(wait_sec)
                     continue
                 break
             except Exception as exc:
                 last_error_msg = f"Netzwerkfehler bei {model_name}: {exc}"
-                if attempt == 0:
-                    time.sleep(1.5)
+                if attempt < len(backoff_seconds) - 1:
+                    time.sleep(wait_sec)
                     continue
                 break
 
