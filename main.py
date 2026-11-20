@@ -1,4 +1,5 @@
 from difflib import SequenceMatcher
+import html
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
@@ -22,6 +24,38 @@ _quote_cache_lock = threading.Lock()
 
 _analysis_cache: dict[str, tuple[float, dict]] = {}
 _analysis_cache_lock = threading.Lock()
+
+PEER_GROUPS: dict[str, list[str]] = {
+    "AAPL": ["Microsoft (MSFT)", "Alphabet (GOOGL)", "Samsung Electronics", "Sony (SONY)"],
+    "MSFT": ["Alphabet (GOOGL)", "Apple (AAPL)", "Oracle (ORCL)", "SAP (SAP.DE)"],
+    "GOOGL": ["Microsoft (MSFT)", "Meta Platforms (META)", "Amazon (AMZN)", "Apple (AAPL)"],
+    "GOOG": ["Microsoft (MSFT)", "Meta Platforms (META)", "Amazon (AMZN)", "Apple (AAPL)"],
+    "AMZN": ["Microsoft (MSFT)", "Alphabet (GOOGL)", "Walmart (WMT)", "Shopify (SHOP)"],
+    "META": ["Alphabet (GOOGL)", "Snap (SNAP)", "Pinterest (PINS)", "TikTok / ByteDance"],
+    "NVDA": ["AMD (AMD)", "Broadcom (AVGO)", "Intel (INTC)", "TSMC (TSM)"],
+    "AMD": ["NVIDIA (NVDA)", "Intel (INTC)", "Broadcom (AVGO)", "Qualcomm (QCOM)"],
+    "INTC": ["TSMC (TSM)", "Samsung Foundry", "NVIDIA (NVDA)", "AMD (AMD)"],
+    "TSM": ["Samsung Foundry", "Intel (INTC)", "ASML (ASML)", "Broadcom (AVGO)"],
+    "ASML": ["Applied Materials (AMAT)", "Lam Research (LRCX)", "KLA (KLAC)", "Tokyo Electron"],
+    "TSLA": ["BYD", "Volkswagen (VOW3.DE)", "Rivian (RIVN)", "Hyundai"],
+    "VOW3.DE": ["BMW (BMW.DE)", "Mercedes-Benz (MBG.DE)", "Tesla (TSLA)", "Stellantis"],
+    "BMW.DE": ["Mercedes-Benz (MBG.DE)", "Volkswagen (VOW3.DE)", "Tesla (TSLA)"],
+    "MBG.DE": ["BMW (BMW.DE)", "Volkswagen (VOW3.DE)", "Tesla (TSLA)"],
+    "SAP.DE": ["Microsoft (MSFT)", "Oracle (ORCL)", "Salesforce (CRM)", "ServiceNow (NOW)"],
+    "SIE.DE": ["ABB", "Schneider Electric", "Honeywell (HON)", "General Electric (GE)"],
+    "ALV.DE": ["Munich Re (MUV2.DE)", "AXA", "Zurich Insurance", "Generali"],
+    "MUV2.DE": ["Hannover Rück (HNR1.DE)", "Allianz (ALV.DE)", "Swiss Re"],
+    "DTE.DE": ["Vodafone (VOD)", "Orange", "Telefónica", "Deutsche Telekom"],
+    "BAS.DE": ["Dow", "LyondellBasell", "Evonik (EVK.DE)", "Covestro"],
+    "AIR.PA": ["Boeing (BA)", "Embraer", "GE Aerospace"],
+    "NOVO-B.CO": ["Eli Lilly (LLY)", "Sanofi (SAN.PA)", "AstraZeneca (AZN)"],
+    "LLY": ["Novo Nordisk", "Johnson & Johnson (JNJ)", "Merck & Co. (MRK)"],
+    "JPM": ["Bank of America (BAC)", "Citigroup (C)", "Goldman Sachs (GS)", "Morgan Stanley (MS)"],
+    "V": ["Mastercard (MA)", "American Express (AXP)", "PayPal (PYPL)"],
+    "MA": ["Visa (V)", "American Express (AXP)", "PayPal (PYPL)"],
+    "KO": ["PepsiCo (PEP)", "Monster Beverage (MNST)", "Keurig Dr Pepper (KDP)"],
+    "PEP": ["Coca-Cola (KO)", "Mondelez (MDLZ)", "Nestlé"],
+}
 
 
 def load_stocks() -> list[dict]:
@@ -56,6 +90,37 @@ class DeepAnalysisRequest(BaseModel):
 
 def clamp_score(value: float) -> float:
     return max(0.0, min(10.0, value))
+
+
+def safe_float(value: object, default: float = 5.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
+def safe_str_list(value: object, limit: int) -> list[str]:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def normalize_text(value: str) -> str:
@@ -122,7 +187,12 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     price = meta.get("regularMarketPrice")
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     currency = meta.get("currency") or "USD"
+    exchange = meta.get("exchangeName") or meta.get("fullExchangeName") or ""
     market_time = meta.get("regularMarketTime")
+    day_high = meta.get("regularMarketDayHigh")
+    day_low = meta.get("regularMarketDayLow")
+    week_52_high = meta.get("fiftyTwoWeekHigh")
+    week_52_low = meta.get("fiftyTwoWeekLow")
 
     if price is None:
         raise ValueError(f"Kein aktueller Kurs für '{clean_ticker}' verfügbar")
@@ -136,31 +206,97 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
         else None
     )
 
+    w52_high_val = float(week_52_high) if week_52_high is not None else None
+    w52_low_val = float(week_52_low) if week_52_low is not None else None
+    distance_52w_high_pct = (
+        round(((price_val - w52_high_val) / w52_high_val) * 100.0, 2)
+        if w52_high_val not in (None, 0.0)
+        else None
+    )
+
     return {
         "ticker": clean_ticker,
         "price": round(price_val, 4),
         "previous_close": round(prev_val, 4) if prev_val is not None else None,
         "change": change,
         "change_percent": change_percent,
+        "day_high": round(float(day_high), 4) if day_high is not None else None,
+        "day_low": round(float(day_low), 4) if day_low is not None else None,
+        "fifty_two_week_high": round(w52_high_val, 4) if w52_high_val is not None else None,
+        "fifty_two_week_low": round(w52_low_val, 4) if w52_low_val is not None else None,
+        "distance_from_52w_high_percent": distance_52w_high_pct,
         "currency": currency,
+        "exchange": exchange,
         "market_timestamp": market_time,
         "delayed_note": "Kursdaten können je nach Börse/Quelle leicht verzögert sein",
         "cached": False,
     }
 
 
+def _fetch_recent_news(ticker: str, limit: int = 5) -> list[str]:
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        return []
+
+    encoded = urllib.parse.quote(clean_ticker)
+    url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={encoded}&region=US&lang=en-US"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/xml, text/xml",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            xml_data = resp.read()
+        root_elem = ET.fromstring(xml_data)
+    except Exception:
+        return []
+
+    headlines: list[str] = []
+    for item in root_elem.findall(".//channel/item"):
+        title_elem = item.find("title")
+        if title_elem is None or not title_elem.text:
+            continue
+        title = html.unescape(title_elem.text).strip()
+        if title and title not in headlines:
+            headlines.append(title)
+        if len(headlines) >= limit:
+            break
+
+    return headlines
+
+
 def _find_competitor_candidates(target_ticker: str, target_name: str, limit: int = 5) -> list[str]:
     target_t = target_ticker.strip().upper()
-    target_prefix = normalize_text(target_name).split(" ")[0] if target_name else ""
+    target_root = target_t.split(".")[0] if target_t else ""
+    target_name_norm = normalize_text(target_name)
     candidates: list[str] = []
 
+    curated = PEER_GROUPS.get(target_t) or PEER_GROUPS.get(target_root) or []
+    for peer in curated:
+        peer_norm = normalize_text(peer)
+        if target_root and target_root == peer_norm.upper():
+            continue
+        if target_name_norm and len(target_name_norm) >= 4 and target_name_norm in peer_norm:
+            continue
+        if peer not in candidates:
+            candidates.append(peer)
+        if len(candidates) >= limit:
+            return candidates
+
+    target_prefix = target_name_norm.split(" ")[0] if target_name_norm else ""
     for s in STOCKS:
         t = str(s.get("ticker", "")).strip().upper()
         n = str(s.get("name", "")).strip()
         if not t or t == target_t:
             continue
         if target_prefix and len(target_prefix) >= 3 and target_prefix in normalize_text(n):
-            candidates.append(f"{n} ({t})")
+            entry = f"{n} ({t})"
+            if entry not in candidates:
+                candidates.append(entry)
         if len(candidates) >= limit:
             break
 
@@ -174,9 +310,29 @@ def _build_llm_prompt(
     isin: str,
     quote_info: dict | None,
     competitors: list[str],
+    headlines: list[str],
 ) -> str:
-    quote_str = json.dumps(quote_info, ensure_ascii=False) if quote_info else "Keine Live-Kursdaten verfügbar"
+    if quote_info:
+        currency = str(quote_info.get("currency") or "USD").upper()
+        currency_hint = (
+            "Notiert in EUR (kein direktes Währungsrisiko für Euro-Anleger)."
+            if currency == "EUR"
+            else f"Notiert in {currency} (Wechselkursrisiko gegenüber EUR für Euro-Anleger berücksichtigen)."
+        )
+        quote_str = json.dumps(quote_info, ensure_ascii=False)
+    else:
+        currency_hint = "Währung unbekannt, da keine Live-Kursdaten abgerufen werden konnten."
+        quote_str = (
+            "Keine aktuellen Kursdaten verfügbar. WICHTIG: Erfinde oder schätze keinen aktuellen Aktienkurs, "
+            "sondern weise sachlich darauf hin, dass keine Live-Kursdaten vorlagen."
+        )
+
     peers_str = ", ".join(competitors) if competitors else "Keine direkten Kandidaten aus lokalem Katalog abgeleitet"
+    news_str = (
+        " | ".join(headlines)
+        if headlines
+        else "Keine aktuellen Schlagzeilen abgerufen; stütze dich nur auf bekannte Fakten und Kursdaten."
+    )
 
     return f"""
 Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den Wert sachlich, knapp und ohne Anlageberatung.
@@ -187,14 +343,20 @@ Wert:
 - Name: {company_name or "Unbekannt"}
 - WKN: {wkn or "-"}
 - ISIN: {isin or "-"}
-- Kursdaten: {quote_str}
+- Währungskontext: {currency_hint}
+- Kursdaten (inkl. 52-Wochen-Spanne falls vorhanden): {quote_str}
 - Wettbewerber-Hinweise: {peers_str}
+- Aktuelle Schlagzeilen: {news_str}
 
-Bewerte jede Dimension von 0.0 bis 10.0 mit jeweils 1-2 kurzen Sätzen auf Deutsch:
-1. history_and_price: Kursverlauf, Trend, Volatilität und aktueller Kurs.
-2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur und Margen.
+Bewerte jede Dimension von 0.0 bis 10.0 (Dezimalzahl mit Punkt, z. B. 7.5) mit jeweils 1-2 kurzen Sätzen auf Deutsch:
+1. history_and_price: Kursverlauf, Einordnung in die 52-Wochen-Spanne, Trend, Volatilität und aktueller Kurs.
+2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur, Margen und ggf. Währungseffekte.
 3. politics_and_regulation: Politik, Regularien, Zölle und Gesetze.
-4. competition_and_moat: Wettbewerb, Burggraben und Konkurrenten.
+4. competition_and_moat: Wettbewerb, Burggraben und relevante Konkurrenten.
+
+Wichtige Regeln:
+- Der overall_score soll dem Durchschnitt deiner vier Dimensions-Scores entsprechen.
+- Erfinde keine konkreten aktuellen Kurse, Zahlen oder News, die nicht in den bereitgestellten Daten stehen.
 
 JSON-Schema:
 {{
@@ -288,7 +450,10 @@ def _call_gemini_json(prompt: str) -> dict:
         raise RuntimeError("Leere Textantwort vom LLM erhalten")
 
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.IGNORECASE | re.DOTALL).strip()
-    return json.loads(cleaned)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("LLM hat kein gültiges JSON-Objekt zurückgegeben")
+    return parsed
 
 
 @app.get("/")
@@ -436,6 +601,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         quote_info = None
 
     competitors = _find_competitor_candidates(clean_ticker, resolved_name)
+    headlines = _fetch_recent_news(clean_ticker, limit=5)
     prompt = _build_llm_prompt(
         ticker=clean_ticker,
         company_name=resolved_name,
@@ -443,6 +609,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         isin=resolved_isin,
         quote_info=quote_info,
         competitors=competitors,
+        headlines=headlines,
     )
 
     try:
@@ -450,13 +617,15 @@ def analyze_stock(req_data: DeepAnalysisRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM-Analyse fehlgeschlagen: {exc}") from exc
 
-    dims = llm_result.get("dimensions") or {}
+    raw_dims = llm_result.get("dimensions")
+    dims = raw_dims if isinstance(raw_dims, dict) else {}
 
     def norm_dim(key: str) -> dict:
-        d = dims.get(key) or {}
+        raw_d = dims.get(key)
+        d = raw_d if isinstance(raw_d, dict) else {}
         return {
-            "score": round(clamp_score(float(d.get("score", 5.0))), 1),
-            "analysis": str(d.get("analysis", "")).strip(),
+            "score": round(clamp_score(safe_float(d.get("score"), 5.0)), 1),
+            "analysis": str(d.get("analysis") or "").strip(),
         }
 
     norm_dims = {
@@ -466,20 +635,14 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "competition_and_moat": norm_dim("competition_and_moat"),
     }
 
-    overall_raw = llm_result.get("overall_score")
-    if overall_raw is not None:
-        overall = round(clamp_score(float(overall_raw)), 2)
-    else:
-        overall = round(sum(v["score"] for v in norm_dims.values()) / 4.0, 2)
+    overall = round(sum(v["score"] for v in norm_dims.values()) / 4.0, 2)
 
-    status = str(llm_result.get("status") or "").strip()
-    if not status:
-        if overall >= 7.5:
-            status = "Starkes Profil (Grün)"
-        elif overall >= 5.0:
-            status = "Solide / Beobachten (Gelb)"
-        else:
-            status = "Schwaches Profil (Rot)"
+    if overall >= 7.5:
+        status = "Starkes Profil (Grün)"
+    elif overall >= 5.0:
+        status = "Solide / Beobachten (Gelb)"
+    else:
+        status = "Schwaches Profil (Rot)"
 
     final_payload = {
         "ticker": clean_ticker,
@@ -487,13 +650,15 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "wkn": resolved_wkn,
         "isin": resolved_isin,
         "quote": quote_info,
+        "quote_available": quote_info is not None,
+        "recent_headlines": headlines,
         "overall_score": overall,
         "status": status,
-        "summary": str(llm_result.get("summary", "")).strip(),
+        "summary": str(llm_result.get("summary") or "").strip(),
         "dimensions": norm_dims,
-        "competitors": [str(c) for c in (llm_result.get("competitors") or []) if str(c).strip()][:6],
-        "key_catalysts": [str(c) for c in (llm_result.get("key_catalysts") or []) if str(c).strip()][:5],
-        "key_risks": [str(r) for r in (llm_result.get("key_risks") or []) if str(r).strip()][:5],
+        "competitors": safe_str_list(llm_result.get("competitors"), 6),
+        "key_catalysts": safe_str_list(llm_result.get("key_catalysts"), 5),
+        "key_risks": safe_str_list(llm_result.get("key_risks"), 5),
         "cached": False,
         "disclaimer": str(
             llm_result.get("disclaimer")
