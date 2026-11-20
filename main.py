@@ -298,113 +298,145 @@ def _pick_metric(metrics: dict, keys: list[str]) -> float | None:
     return None
 
 
-def _score_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float | None, str]:
-    sub_scores: list[float] = []
+def _rate_single_metric(key: str, val: float | None) -> dict:
+    if val is None:
+        return {
+            "value": None,
+            "score": None,
+            "signal": "none",
+            "label": "Keine Daten",
+        }
 
-    pe = metrics_map.get("pe_ttm")
-    if pe is not None and pe > 0.0:
-        if pe <= 12.0:
-            sub_scores.append(9.0)
-        elif pe <= 18.0:
-            sub_scores.append(7.5)
-        elif pe <= 25.0:
-            sub_scores.append(6.0)
-        elif pe <= 35.0:
-            sub_scores.append(4.5)
-        else:
-            sub_scores.append(3.0)
+    rounded_val = round(val, 2)
 
-    pb = metrics_map.get("pb")
-    if pb is not None and pb > 0.0:
-        if pb <= 1.5:
-            sub_scores.append(8.5)
-        elif pb <= 3.5:
-            sub_scores.append(7.0)
-        elif pb <= 7.0:
-            sub_scores.append(5.5)
-        elif pb <= 12.0:
-            sub_scores.append(4.0)
-        else:
-            sub_scores.append(3.0)
+    if key == "pe_ttm":
+        if val <= 0.0:
+            return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ / kein Gewinn"}
+        if val <= 12.0:
+            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Günstig bewertet"}
+        if val <= 18.0:
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv"}
+        if val <= 25.0:
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Moderat"}
+        if val <= 35.0:
+            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Erhöht"}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Sportlich bewertet"}
 
-    ps = metrics_map.get("ps_ttm")
-    if ps is not None and ps > 0.0:
-        if ps <= 1.5:
-            sub_scores.append(8.5)
-        elif ps <= 4.0:
-            sub_scores.append(7.0)
-        elif ps <= 8.0:
-            sub_scores.append(5.5)
-        else:
-            sub_scores.append(3.5)
+    if key == "pb":
+        if val <= 0.0:
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Negatives Eigenkapital"}
+        if val <= 1.5:
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig"}
+        if val <= 3.5:
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide"}
+        if val <= 7.0:
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
+        if val <= 12.0:
+            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Erhöht"}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch"}
 
-    roe = metrics_map.get("roe_ttm")
-    if roe is not None:
-        if roe >= 25.0:
-            sub_scores.append(9.0)
-        elif roe >= 15.0:
-            sub_scores.append(7.5)
-        elif roe >= 8.0:
-            sub_scores.append(6.0)
-        elif roe >= 0.0:
-            sub_scores.append(4.5)
-        else:
-            sub_scores.append(2.5)
+    if key == "ps_ttm":
+        if val <= 0.0:
+            return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Kein Umsatz"}
+        if val <= 1.5:
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig"}
+        if val <= 4.0:
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide"}
+        if val <= 8.0:
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
+        return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Hoch"}
 
-    margin = metrics_map.get("net_margin_ttm")
-    if margin is not None:
-        if margin >= 20.0:
-            sub_scores.append(8.5)
-        elif margin >= 10.0:
-            sub_scores.append(7.0)
-        elif margin >= 3.0:
-            sub_scores.append(5.5)
-        elif margin >= 0.0:
-            sub_scores.append(4.0)
-        else:
-            sub_scores.append(2.5)
+    if key == "roe_ttm":
+        if val >= 25.0:
+            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Sehr stark"}
+        if val >= 15.0:
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Gut"}
+        if val >= 8.0:
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Durchschnittlich"}
+        if val >= 0.0:
+            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Schwach"}
+        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ"}
 
-    debt_eq = metrics_map.get("debt_to_equity")
-    if debt_eq is not None and debt_eq >= 0.0:
-        norm_de = debt_eq / 100.0 if debt_eq > 10.0 else debt_eq
+    if key == "net_margin_ttm":
+        if val >= 20.0:
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr hoch"}
+        if val >= 12.0:
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Solide"}
+        if val >= 5.0:
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
+        if val >= 0.0:
+            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Knapp"}
+        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Defizitär"}
+
+    if key == "debt_to_equity":
+        if val < 0.0:
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch"}
+        norm_de = val / 100.0 if val > 10.0 else val
         if norm_de <= 0.4:
-            sub_scores.append(8.5)
-        elif norm_de <= 1.0:
-            sub_scores.append(7.0)
-        elif norm_de <= 2.0:
-            sub_scores.append(5.0)
-        else:
-            sub_scores.append(3.0)
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr niedrig"}
+        if norm_de <= 1.0:
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Kontrolliert"}
+        if norm_de <= 2.0:
+            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Erhöht"}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch verschuldet"}
 
-    curr_ratio = metrics_map.get("current_ratio")
-    if curr_ratio is not None and curr_ratio > 0.0:
-        if curr_ratio >= 1.5:
-            sub_scores.append(8.0)
-        elif curr_ratio >= 1.0:
-            sub_scores.append(6.5)
-        else:
-            sub_scores.append(4.0)
+    if key == "current_ratio":
+        if val <= 0.0:
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch"}
+        if val >= 1.5:
+            return {"value": rounded_val, "score": 8.0, "signal": "green", "label": "Komfortabel"}
+        if val >= 1.0:
+            return {"value": rounded_val, "score": 6.5, "signal": "yellow", "label": "Ausreichend"}
+        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Knapp"}
 
-    div_yield = metrics_map.get("dividend_yield")
-    if div_yield is not None and div_yield > 0.0:
-        if 1.5 <= div_yield <= 6.0:
-            sub_scores.append(7.5)
-        elif div_yield < 1.5:
-            sub_scores.append(6.0)
-        else:
-            sub_scores.append(5.5)
+    if key == "dividend_yield":
+        if val <= 0.0:
+            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Keine Dividende"}
+        if 1.5 <= val <= 6.0:
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv"}
+        if val < 1.5:
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Niedrig"}
+        if val <= 8.0:
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Hoch"}
+        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Auffällig hoch"}
 
-    if not sub_scores:
-        return None, "Keine ausreichenden Fundamentalkennzahlen verfügbar"
+    return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Neutral"}
 
-    score = round(clamp_score(sum(sub_scores) / len(sub_scores)), 2)
+
+def _evaluate_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float | None, str, dict[str, dict], dict[str, int]]:
+    ratings: dict[str, dict] = {}
+    scores: list[float] = []
+    counts = {"green": 0, "yellow": 0, "red": 0}
+
+    for key in [
+        "pe_ttm",
+        "ps_ttm",
+        "pb",
+        "roe_ttm",
+        "net_margin_ttm",
+        "debt_to_equity",
+        "current_ratio",
+        "dividend_yield",
+    ]:
+        item = _rate_single_metric(key, metrics_map.get(key))
+        ratings[key] = item
+        sig = item["signal"]
+        if sig in counts:
+            counts[sig] += 1
+        if item["score"] is not None:
+            scores.append(float(item["score"]))
+
+    if not scores:
+        return None, "Keine ausreichenden Fundamentalkennzahlen verfügbar", ratings, counts
+
+    score = round(clamp_score(sum(scores) / len(scores)), 2)
     if score >= 7.5:
         label = "Solide Fundamentaldaten"
     elif score >= 5.0:
         label = "Gemischte Fundamentaldaten"
     else:
         label = "Schwache / anspruchsvolle Fundamentaldaten"
-    return score, label
+    return score, label, ratings, counts
 
 
 def _fetch_fundamentals(ticker: str) -> dict | None:
@@ -457,7 +489,7 @@ def _fetch_fundamentals(ticker: str) -> dict | None:
         if available_count == 0:
             continue
 
-        score, assessment = _score_fundamentals(extracted)
+        score, assessment, ratings, counts = _evaluate_fundamentals(extracted)
         rounded_metrics = {
             k: (round(v, 2) if v is not None else None)
             for k, v in extracted.items()
@@ -469,7 +501,9 @@ def _fetch_fundamentals(ticker: str) -> dict | None:
             "fundamental_score": score,
             "assessment": assessment,
             "metrics_count": available_count,
+            "signal_counts": counts,
             "metrics": rounded_metrics,
+            "metric_ratings": ratings,
         }
 
     return None
@@ -673,7 +707,7 @@ Wert:
 - ISIN: {isin or "-"}
 - Währungskontext: {currency_hint}
 - Kurs- & Spannenkennzahlen (inkl. 52-Wochen-Spanne, Tagesrange & Volumen falls vorhanden): {quote_str}
-- Fundamentalkennzahlen & Fundamental-Score: {fundamentals_str}
+- Fundamentalkennzahlen, Ampel-Vorabbewertung & Fundamental-Score: {fundamentals_str}
 - Analysten-Zähler (Buy/Hold/Sell): {ratings_str}
 - Wettbewerber-Hinweise: {peers_str}
 - Aktuelle Schlagzeilen: {news_str}
@@ -754,7 +788,6 @@ def _call_gemini_json(prompt: str) -> dict:
                 short_detail = detail_body.replace("\n", " ")[:180]
                 model_errors.append(f"{model_name}: HTTP {err.code} ({short_detail})")
                 if err.code in (400, 404, 429):
-                    # Bei Modell-/Rate-Limit-Fehlern direkt nächstes Fallback-Modell probieren
                     break
                 if err.code == 503 and attempt < len(backoff_seconds) - 1:
                     time.sleep(wait_sec)
