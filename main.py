@@ -366,7 +366,6 @@ def _score_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float | N
 
     debt_eq = metrics_map.get("debt_to_equity")
     if debt_eq is not None and debt_eq >= 0.0:
-        # Finnhub liefert Verschuldungsgrade teils in % (z. B. 85.0) oder als Faktor (z. B. 0.85)
         norm_de = debt_eq / 100.0 if debt_eq > 10.0 else debt_eq
         if norm_de <= 0.4:
             sub_scores.append(8.5)
@@ -716,9 +715,10 @@ def _call_gemini_json(prompt: str) -> dict:
     primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
     fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
 
-    models_to_try: list[str] = [primary_model]
-    if fallback_model and fallback_model not in models_to_try:
-        models_to_try.append(fallback_model)
+    models_to_try: list[str] = []
+    for candidate_model in [primary_model, fallback_model, "gemini-3.5-flash", "gemini-2.5-flash"]:
+        if candidate_model and candidate_model not in models_to_try:
+            models_to_try.append(candidate_model)
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -729,8 +729,8 @@ def _call_gemini_json(prompt: str) -> dict:
     }
 
     raw_body: dict | None = None
-    last_error_msg = "Unbekannter LLM-Fehler"
-    backoff_seconds = [1.5, 3.0, 6.0]
+    model_errors: list[str] = []
+    backoff_seconds = [1.5, 3.0]
 
     for model_name in models_to_try:
         url = (
@@ -751,15 +751,17 @@ def _call_gemini_json(prompt: str) -> dict:
                 break
             except urllib.error.HTTPError as err:
                 detail_body = err.read().decode("utf-8", errors="replace")
-                if err.code == 429:
-                    raise RuntimeError("Gemini Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
-                last_error_msg = f"Gemini HTTP {err.code} ({model_name}): {detail_body[:250]}"
+                short_detail = detail_body.replace("\n", " ")[:180]
+                model_errors.append(f"{model_name}: HTTP {err.code} ({short_detail})")
+                if err.code in (400, 404, 429):
+                    # Bei Modell-/Rate-Limit-Fehlern direkt nächstes Fallback-Modell probieren
+                    break
                 if err.code == 503 and attempt < len(backoff_seconds) - 1:
                     time.sleep(wait_sec)
                     continue
                 break
             except Exception as exc:
-                last_error_msg = f"Netzwerkfehler bei {model_name}: {exc}"
+                model_errors.append(f"{model_name}: {exc}")
                 if attempt < len(backoff_seconds) - 1:
                     time.sleep(wait_sec)
                     continue
@@ -769,7 +771,8 @@ def _call_gemini_json(prompt: str) -> dict:
             break
 
     if not raw_body:
-        raise RuntimeError(last_error_msg)
+        summary_err = " | ".join(model_errors[-3:]) if model_errors else "Unbekannter LLM-Fehler"
+        raise RuntimeError(f"Alle Gemini-Modelle fehlgeschlagen: {summary_err}")
 
     candidates = raw_body.get("candidates") or []
     if not candidates:
