@@ -107,6 +107,15 @@ def safe_float(value: object, default: float = 5.0) -> float:
         return default
 
 
+def safe_int(value: object, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return max(0, int(float(str(value).strip())))
+    except (ValueError, TypeError):
+        return default
+
+
 def safe_str_list(value: object, limit: int) -> list[str]:
     if isinstance(value, str):
         cleaned = value.strip()
@@ -261,6 +270,80 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     }
 
 
+def _fetch_analyst_ratings(ticker: str) -> dict | None:
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        return None
+
+    candidates: list[str] = [clean_ticker]
+    root_ticker = clean_ticker.split(".")[0]
+    if root_ticker and root_ticker not in candidates:
+        candidates.append(root_ticker)
+
+    for sym in candidates:
+        encoded_sym = urllib.parse.quote(sym)
+        encoded_key = urllib.parse.quote(api_key)
+        url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={encoded_sym}&token={encoded_key}"
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            continue
+
+        if not isinstance(data, list) or not data:
+            continue
+
+        latest = data[0] if isinstance(data[0], dict) else None
+        if not latest:
+            continue
+
+        strong_buy = safe_int(latest.get("strongBuy"))
+        buy = safe_int(latest.get("buy"))
+        hold = safe_int(latest.get("hold"))
+        sell = safe_int(latest.get("sell"))
+        strong_sell = safe_int(latest.get("strongSell"))
+
+        total_buy = strong_buy + buy
+        total_sell = sell + strong_sell
+        total_count = total_buy + hold + total_sell
+
+        if total_count == 0:
+            consensus = "Keine Daten"
+        elif strong_buy > total_buy and strong_buy >= hold and strong_buy >= total_sell:
+            consensus = "Strong Buy"
+        elif total_buy >= hold and total_buy >= total_sell:
+            consensus = "Buy"
+        elif total_sell > total_buy and total_sell >= hold:
+            consensus = "Sell"
+        else:
+            consensus = "Hold"
+
+        return {
+            "source": "finnhub",
+            "symbol_queried": sym,
+            "period": str(latest.get("period") or ""),
+            "strong_buy": strong_buy,
+            "buy": buy,
+            "hold": hold,
+            "sell": sell,
+            "strong_sell": strong_sell,
+            "buy_total": total_buy,
+            "sell_total": total_sell,
+            "total_analysts": total_count,
+            "consensus": consensus,
+        }
+
+    return None
+
+
 def _fetch_recent_news(ticker: str, limit: int = 5) -> list[str]:
     clean_ticker = ticker.strip().upper()
     if not clean_ticker:
@@ -339,6 +422,7 @@ def _build_llm_prompt(
     quote_info: dict | None,
     competitors: list[str],
     headlines: list[str],
+    ratings_info: dict | None = None,
 ) -> str:
     if quote_info:
         currency = str(quote_info.get("currency") or "USD").upper()
@@ -361,6 +445,11 @@ def _build_llm_prompt(
         if headlines
         else "Keine aktuellen Schlagzeilen abgerufen; stütze dich nur auf bekannte Fakten und Kursdaten."
     )
+    ratings_str = (
+        json.dumps(ratings_info, ensure_ascii=False)
+        if ratings_info and ratings_info.get("total_analysts", 0) > 0
+        else "Keine Analysten-Zähler verfügbar"
+    )
 
     return f"""
 Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den Wert sachlich, knapp und ohne Anlageberatung.
@@ -373,6 +462,7 @@ Wert:
 - ISIN: {isin or "-"}
 - Währungskontext: {currency_hint}
 - Kurs- & Spannenkennzahlen (inkl. 52-Wochen-Spanne, Tagesrange & Volumen falls vorhanden): {quote_str}
+- Analysten-Zähler (Buy/Hold/Sell): {ratings_str}
 - Wettbewerber-Hinweise: {peers_str}
 - Aktuelle Schlagzeilen: {news_str}
 
@@ -492,6 +582,7 @@ def root():
         "loaded_stocks": len(STOCKS),
         "llm_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "llm_model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash",
+        "ratings_configured": bool(os.getenv("FINNHUB_API_KEY", "").strip()),
     }
 
 
@@ -630,6 +721,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
 
     competitors = _find_competitor_candidates(clean_ticker, resolved_name)
     headlines = _fetch_recent_news(clean_ticker, limit=5)
+    ratings_info = _fetch_analyst_ratings(clean_ticker)
     prompt = _build_llm_prompt(
         ticker=clean_ticker,
         company_name=resolved_name,
@@ -638,6 +730,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         quote_info=quote_info,
         competitors=competitors,
         headlines=headlines,
+        ratings_info=ratings_info,
     )
 
     try:
@@ -679,6 +772,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "isin": resolved_isin,
         "quote": quote_info,
         "quote_available": quote_info is not None,
+        "analyst_ratings": ratings_info,
         "recent_headlines": headlines,
         "overall_score": overall,
         "status": status,
