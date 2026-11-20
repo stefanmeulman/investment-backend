@@ -1,9 +1,11 @@
 from difflib import SequenceMatcher
 import json
+import os
 from pathlib import Path
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from fastapi import FastAPI, HTTPException, Query
@@ -13,9 +15,13 @@ app = FastAPI(title="Investment Score API")
 
 DATA_FILE = Path(__file__).parent / "stocks_tr.json"
 QUOTE_CACHE_TTL_SECONDS = 60
+ANALYSIS_CACHE_TTL_SECONDS = 60 * 60 * 12  # 12 Stunden
 
 _quote_cache: dict[str, tuple[float, dict]] = {}
 _quote_cache_lock = threading.Lock()
+
+_analysis_cache: dict[str, tuple[float, dict]] = {}
+_analysis_cache_lock = threading.Lock()
 
 
 def load_stocks() -> list[dict]:
@@ -38,6 +44,14 @@ class StockScoreRequest(BaseModel):
     quality_value_score: float
     factor_score: float
     dividend_cashflow_score: float
+
+
+class DeepAnalysisRequest(BaseModel):
+    ticker: str
+    company_name: str = ""
+    wkn: str = ""
+    isin: str = ""
+    force_refresh: bool = False
 
 
 def clamp_score(value: float) -> float:
@@ -135,12 +149,128 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     }
 
 
+def _find_competitor_candidates(target_ticker: str, target_name: str, limit: int = 5) -> list[str]:
+    target_t = target_ticker.strip().upper()
+    target_prefix = normalize_text(target_name).split(" ")[0] if target_name else ""
+    candidates: list[str] = []
+
+    for s in STOCKS:
+        t = str(s.get("ticker", "")).strip().upper()
+        n = str(s.get("name", "")).strip()
+        if not t or t == target_t:
+            continue
+        if target_prefix and len(target_prefix) >= 3 and target_prefix in normalize_text(n):
+            candidates.append(f"{n} ({t})")
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def _build_llm_prompt(
+    ticker: str,
+    company_name: str,
+    wkn: str,
+    isin: str,
+    quote_info: dict | None,
+    competitors: list[str],
+) -> str:
+    quote_str = json.dumps(quote_info, ensure_ascii=False) if quote_info else "Keine Live-Kursdaten verfügbar"
+    peers_str = ", ".join(competitors) if competitors else "Keine direkten Kandidaten aus lokalem Katalog abgeleitet"
+
+    return f"""
+Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den folgenden Wert sachlich, nüchtern und ohne Anlageberatung.
+Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt (ohne Markdown-Codeblöcke, ohne zusätzlichen Text davor oder danach).
+
+Zielwert:
+- Ticker: {ticker}
+- Name: {company_name or "Unbekannt"}
+- WKN: {wkn or "-"}
+- ISIN: {isin or "-"}
+- Aktuelle Kursdaten: {quote_str}
+- Mögliche Wettbewerber-Kandidaten: {peers_str}
+
+Bewerte jede Dimension von 0.0 bis 10.0 und liefere kompakte, präzise Begründungen auf Deutsch:
+1. history_and_price: Historische Kursentwicklung, Trends, Volatilität und Einordnung aktueller Kursdaten.
+2. economics_and_macro: Makroökonomisches Umfeld (Zinsen, Konjunktur, Währung, Margen/Geschäftsmodell).
+3. politics_and_regulation: Politische Ereignisse, Regularien, Zölle, Gesetze und deren wahrscheinliche Kurswirkung.
+4. competition_and_moat: Wettbewerbsposition, Burggraben (Moat) und Vergleich mit Konkurrenten.
+
+Verwende exakt dieses JSON-Schema:
+{{
+  "overall_score": 0.0,
+  "status": "Starkes Profil | Solide / Beobachten | Schwaches Profil",
+  "summary": "Kurzfassung in 2-3 Sätzen",
+  "dimensions": {{
+    "history_and_price": {{ "score": 0.0, "analysis": "..." }},
+    "economics_and_macro": {{ "score": 0.0, "analysis": "..." }},
+    "politics_and_regulation": {{ "score": 0.0, "analysis": "..." }},
+    "competition_and_moat": {{ "score": 0.0, "analysis": "..." }}
+  }},
+  "competitors": ["Konkurrent 1", "Konkurrent 2"],
+  "key_catalysts": ["Chance/Treiber 1", "Chance/Treiber 2"],
+  "key_risks": ["Risiko 1", "Risiko 2"],
+  "disclaimer": "KI-gestützte Analyse auf Basis bereitgestellter Marktdaten; keine Anlageberatung."
+}}
+""".strip()
+
+
+def _call_gemini_json(prompt: str) -> dict:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY ist auf dem Server nicht gesetzt")
+
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(api_key)}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw_body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        detail_body = err.read().decode("utf-8", errors="replace")
+        if err.code == 429:
+            raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
+        raise RuntimeError(f"Gemini HTTP {err.code}: {detail_body[:300]}") from err
+
+    candidates = raw_body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Keine Antwort-Kandidaten vom LLM erhalten")
+
+    parts = ((candidates[0].get("content") or {}).get("parts")) or []
+    text_out = "".join(str(p.get("text", "")) for p in parts).strip()
+    if not text_out:
+        raise RuntimeError("Leere Textantwort vom LLM erhalten")
+
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.IGNORECASE | re.DOTALL).strip()
+    return json.loads(cleaned)
+
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "Investment Score Backend läuft",
         "loaded_stocks": len(STOCKS),
+        "llm_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+        "llm_model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash",
     }
 
 
@@ -240,6 +370,113 @@ def get_quote(ticker: str = Query(..., min_length=1, description="Ticker-Symbol,
         _quote_cache[clean_ticker] = (now, quote_data)
 
     return quote_data
+
+
+@app.post("/analyze-stock")
+def analyze_stock(req_data: DeepAnalysisRequest):
+    clean_ticker = req_data.ticker.strip().upper()
+    if not clean_ticker:
+        raise HTTPException(status_code=400, detail="Ticker darf nicht leer sein")
+
+    cache_key = f"{clean_ticker}|{req_data.isin.strip().upper()}|{req_data.wkn.strip().upper()}"
+    now = time.time()
+
+    if not req_data.force_refresh:
+        with _analysis_cache_lock:
+            cached = _analysis_cache.get(cache_key)
+            if cached and (now - cached[0]) < ANALYSIS_CACHE_TTL_SECONDS:
+                out = dict(cached[1])
+                out["cached"] = True
+                return out
+
+    resolved_name = req_data.company_name.strip()
+    resolved_wkn = req_data.wkn.strip().upper()
+    resolved_isin = req_data.isin.strip().upper()
+
+    if not resolved_name or not resolved_wkn or not resolved_isin:
+        for s in STOCKS:
+            if str(s.get("ticker", "")).strip().upper() == clean_ticker:
+                resolved_name = resolved_name or str(s.get("name", ""))
+                resolved_wkn = resolved_wkn or str(s.get("wkn", ""))
+                resolved_isin = resolved_isin or str(s.get("isin", ""))
+                break
+
+    quote_info = None
+    try:
+        quote_info = _fetch_yahoo_quote(clean_ticker)
+    except Exception:
+        quote_info = None
+
+    competitors = _find_competitor_candidates(clean_ticker, resolved_name)
+    prompt = _build_llm_prompt(
+        ticker=clean_ticker,
+        company_name=resolved_name,
+        wkn=resolved_wkn,
+        isin=resolved_isin,
+        quote_info=quote_info,
+        competitors=competitors,
+    )
+
+    try:
+        llm_result = _call_gemini_json(prompt)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM-Analyse fehlgeschlagen: {exc}") from exc
+
+    dims = llm_result.get("dimensions") or {}
+
+    def norm_dim(key: str) -> dict:
+        d = dims.get(key) or {}
+        return {
+            "score": round(clamp_score(float(d.get("score", 5.0))), 1),
+            "analysis": str(d.get("analysis", "")).strip(),
+        }
+
+    norm_dims = {
+        "history_and_price": norm_dim("history_and_price"),
+        "economics_and_macro": norm_dim("economics_and_macro"),
+        "politics_and_regulation": norm_dim("politics_and_regulation"),
+        "competition_and_moat": norm_dim("competition_and_moat"),
+    }
+
+    overall_raw = llm_result.get("overall_score")
+    if overall_raw is not None:
+        overall = round(clamp_score(float(overall_raw)), 2)
+    else:
+        overall = round(sum(v["score"] for v in norm_dims.values()) / 4.0, 2)
+
+    status = str(llm_result.get("status") or "").strip()
+    if not status:
+        if overall >= 7.5:
+            status = "Starkes Profil (Grün)"
+        elif overall >= 5.0:
+            status = "Solide / Beobachten (Gelb)"
+        else:
+            status = "Schwaches Profil (Rot)"
+
+    final_payload = {
+        "ticker": clean_ticker,
+        "company_name": resolved_name or clean_ticker,
+        "wkn": resolved_wkn,
+        "isin": resolved_isin,
+        "quote": quote_info,
+        "overall_score": overall,
+        "status": status,
+        "summary": str(llm_result.get("summary", "")).strip(),
+        "dimensions": norm_dims,
+        "competitors": [str(c) for c in (llm_result.get("competitors") or []) if str(c).strip()][:6],
+        "key_catalysts": [str(c) for c in (llm_result.get("key_catalysts") or []) if str(c).strip()][:5],
+        "key_risks": [str(r) for r in (llm_result.get("key_risks") or []) if str(r).strip()][:5],
+        "cached": False,
+        "disclaimer": str(
+            llm_result.get("disclaimer")
+            or "KI-gestützte Analyse auf Basis bereitgestellter Marktdaten; keine Anlageberatung."
+        ).strip(),
+    }
+
+    with _analysis_cache_lock:
+        _analysis_cache[cache_key] = (now, final_payload)
+
+    return final_payload
 
 
 @app.get("/stocks/{identifier}")
