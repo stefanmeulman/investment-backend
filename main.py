@@ -193,6 +193,7 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     day_low = meta.get("regularMarketDayLow")
     week_52_high = meta.get("fiftyTwoWeekHigh")
     week_52_low = meta.get("fiftyTwoWeekLow")
+    volume = meta.get("regularMarketVolume")
 
     if price is None:
         raise ValueError(f"Kein aktueller Kurs für '{clean_ticker}' verfügbar")
@@ -206,11 +207,34 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
         else None
     )
 
+    day_high_val = float(day_high) if day_high is not None else None
+    day_low_val = float(day_low) if day_low is not None else None
+    day_range_pct = (
+        round(((day_high_val - day_low_val) / price_val) * 100.0, 2)
+        if day_high_val is not None and day_low_val is not None and price_val > 0.0
+        else None
+    )
+
     w52_high_val = float(week_52_high) if week_52_high is not None else None
     w52_low_val = float(week_52_low) if week_52_low is not None else None
     distance_52w_high_pct = (
         round(((price_val - w52_high_val) / w52_high_val) * 100.0, 2)
         if w52_high_val not in (None, 0.0)
+        else None
+    )
+    distance_52w_low_pct = (
+        round(((price_val - w52_low_val) / w52_low_val) * 100.0, 2)
+        if w52_low_val not in (None, 0.0)
+        else None
+    )
+    range_52w_pos_pct = (
+        round(
+            max(0.0, min(100.0, ((price_val - w52_low_val) / (w52_high_val - w52_low_val)) * 100.0)),
+            1,
+        )
+        if w52_high_val is not None
+        and w52_low_val is not None
+        and (w52_high_val - w52_low_val) > 0.0
         else None
     )
 
@@ -220,11 +244,15 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
         "previous_close": round(prev_val, 4) if prev_val is not None else None,
         "change": change,
         "change_percent": change_percent,
-        "day_high": round(float(day_high), 4) if day_high is not None else None,
-        "day_low": round(float(day_low), 4) if day_low is not None else None,
+        "day_high": round(day_high_val, 4) if day_high_val is not None else None,
+        "day_low": round(day_low_val, 4) if day_low_val is not None else None,
+        "day_range_percent": day_range_pct,
         "fifty_two_week_high": round(w52_high_val, 4) if w52_high_val is not None else None,
         "fifty_two_week_low": round(w52_low_val, 4) if w52_low_val is not None else None,
         "distance_from_52w_high_percent": distance_52w_high_pct,
+        "distance_from_52w_low_percent": distance_52w_low_pct,
+        "range_52w_position_percent": range_52w_pos_pct,
+        "volume": int(volume) if volume is not None else None,
         "currency": currency,
         "exchange": exchange,
         "market_timestamp": market_time,
@@ -344,12 +372,12 @@ Wert:
 - WKN: {wkn or "-"}
 - ISIN: {isin or "-"}
 - Währungskontext: {currency_hint}
-- Kursdaten (inkl. 52-Wochen-Spanne falls vorhanden): {quote_str}
+- Kurs- & Spannenkennzahlen (inkl. 52-Wochen-Spanne, Tagesrange & Volumen falls vorhanden): {quote_str}
 - Wettbewerber-Hinweise: {peers_str}
 - Aktuelle Schlagzeilen: {news_str}
 
 Bewerte jede Dimension von 0.0 bis 10.0 (Dezimalzahl mit Punkt, z. B. 7.5) mit jeweils 1-2 kurzen Sätzen auf Deutsch:
-1. history_and_price: Kursverlauf, Einordnung in die 52-Wochen-Spanne, Trend, Volatilität und aktueller Kurs.
+1. history_and_price: Kursverlauf, Einordnung in die 52-Wochen-Spanne (Abstand zu Hoch/Tief sowie Position in %), Tagesschwankung/Volumen, Trend und aktueller Kurs.
 2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur, Margen und ggf. Währungseffekte.
 3. politics_and_regulation: Politik, Regularien, Zölle und Gesetze.
 4. competition_and_moat: Wettbewerb, Burggraben und relevante Konkurrenten.
