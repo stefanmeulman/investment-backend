@@ -107,6 +107,25 @@ def safe_float(value: object, default: float = 5.0) -> float:
         return default
 
 
+def safe_optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        val = float(value)
+        return val if val == val and abs(val) != float("inf") else None
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        val = float(match.group(0))
+        return val if val == val and abs(val) != float("inf") else None
+    except ValueError:
+        return None
+
+
 def safe_int(value: object, default: int = 0) -> int:
     if value is None:
         return default
@@ -270,6 +289,193 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     }
 
 
+def _pick_metric(metrics: dict, keys: list[str]) -> float | None:
+    for key in keys:
+        if key in metrics:
+            val = safe_optional_float(metrics.get(key))
+            if val is not None:
+                return val
+    return None
+
+
+def _score_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float | None, str]:
+    sub_scores: list[float] = []
+
+    pe = metrics_map.get("pe_ttm")
+    if pe is not None and pe > 0.0:
+        if pe <= 12.0:
+            sub_scores.append(9.0)
+        elif pe <= 18.0:
+            sub_scores.append(7.5)
+        elif pe <= 25.0:
+            sub_scores.append(6.0)
+        elif pe <= 35.0:
+            sub_scores.append(4.5)
+        else:
+            sub_scores.append(3.0)
+
+    pb = metrics_map.get("pb")
+    if pb is not None and pb > 0.0:
+        if pb <= 1.5:
+            sub_scores.append(8.5)
+        elif pb <= 3.5:
+            sub_scores.append(7.0)
+        elif pb <= 7.0:
+            sub_scores.append(5.5)
+        elif pb <= 12.0:
+            sub_scores.append(4.0)
+        else:
+            sub_scores.append(3.0)
+
+    ps = metrics_map.get("ps_ttm")
+    if ps is not None and ps > 0.0:
+        if ps <= 1.5:
+            sub_scores.append(8.5)
+        elif ps <= 4.0:
+            sub_scores.append(7.0)
+        elif ps <= 8.0:
+            sub_scores.append(5.5)
+        else:
+            sub_scores.append(3.5)
+
+    roe = metrics_map.get("roe_ttm")
+    if roe is not None:
+        if roe >= 25.0:
+            sub_scores.append(9.0)
+        elif roe >= 15.0:
+            sub_scores.append(7.5)
+        elif roe >= 8.0:
+            sub_scores.append(6.0)
+        elif roe >= 0.0:
+            sub_scores.append(4.5)
+        else:
+            sub_scores.append(2.5)
+
+    margin = metrics_map.get("net_margin_ttm")
+    if margin is not None:
+        if margin >= 20.0:
+            sub_scores.append(8.5)
+        elif margin >= 10.0:
+            sub_scores.append(7.0)
+        elif margin >= 3.0:
+            sub_scores.append(5.5)
+        elif margin >= 0.0:
+            sub_scores.append(4.0)
+        else:
+            sub_scores.append(2.5)
+
+    debt_eq = metrics_map.get("debt_to_equity")
+    if debt_eq is not None and debt_eq >= 0.0:
+        # Finnhub liefert Verschuldungsgrade teils in % (z. B. 85.0) oder als Faktor (z. B. 0.85)
+        norm_de = debt_eq / 100.0 if debt_eq > 10.0 else debt_eq
+        if norm_de <= 0.4:
+            sub_scores.append(8.5)
+        elif norm_de <= 1.0:
+            sub_scores.append(7.0)
+        elif norm_de <= 2.0:
+            sub_scores.append(5.0)
+        else:
+            sub_scores.append(3.0)
+
+    curr_ratio = metrics_map.get("current_ratio")
+    if curr_ratio is not None and curr_ratio > 0.0:
+        if curr_ratio >= 1.5:
+            sub_scores.append(8.0)
+        elif curr_ratio >= 1.0:
+            sub_scores.append(6.5)
+        else:
+            sub_scores.append(4.0)
+
+    div_yield = metrics_map.get("dividend_yield")
+    if div_yield is not None and div_yield > 0.0:
+        if 1.5 <= div_yield <= 6.0:
+            sub_scores.append(7.5)
+        elif div_yield < 1.5:
+            sub_scores.append(6.0)
+        else:
+            sub_scores.append(5.5)
+
+    if not sub_scores:
+        return None, "Keine ausreichenden Fundamentalkennzahlen verfügbar"
+
+    score = round(clamp_score(sum(sub_scores) / len(sub_scores)), 2)
+    if score >= 7.5:
+        label = "Solide Fundamentaldaten"
+    elif score >= 5.0:
+        label = "Gemischte Fundamentaldaten"
+    else:
+        label = "Schwache / anspruchsvolle Fundamentaldaten"
+    return score, label
+
+
+def _fetch_fundamentals(ticker: str) -> dict | None:
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        return None
+
+    candidates: list[str] = [clean_ticker]
+    root_ticker = clean_ticker.split(".")[0]
+    if root_ticker and root_ticker not in candidates:
+        candidates.append(root_ticker)
+
+    for sym in candidates:
+        encoded_sym = urllib.parse.quote(sym)
+        encoded_key = urllib.parse.quote(api_key)
+        url = f"https://finnhub.io/api/v1/stock/metric?symbol={encoded_sym}&metric=all&token={encoded_key}"
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        raw_metric = data.get("metric")
+        if not isinstance(raw_metric, dict) or not raw_metric:
+            continue
+
+        extracted: dict[str, float | None] = {
+            "pe_ttm": _pick_metric(raw_metric, ["peBasicExclExtraTTM", "peTTM"]),
+            "ps_ttm": _pick_metric(raw_metric, ["psTTM"]),
+            "pb": _pick_metric(raw_metric, ["pbQuarterly", "pbAnnual"]),
+            "roe_ttm": _pick_metric(raw_metric, ["roeTTM", "roeRfy"]),
+            "net_margin_ttm": _pick_metric(raw_metric, ["netProfitMarginTTM", "netProfitMarginAnnual"]),
+            "debt_to_equity": _pick_metric(raw_metric, ["totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual"]),
+            "current_ratio": _pick_metric(raw_metric, ["currentRatioQuarterly", "currentRatioAnnual"]),
+            "dividend_yield": _pick_metric(raw_metric, ["dividendYieldIndicatedAnnual", "currentDividendYieldTTM"]),
+        }
+
+        available_count = sum(1 for v in extracted.values() if v is not None)
+        if available_count == 0:
+            continue
+
+        score, assessment = _score_fundamentals(extracted)
+        rounded_metrics = {
+            k: (round(v, 2) if v is not None else None)
+            for k, v in extracted.items()
+        }
+
+        return {
+            "source": "finnhub",
+            "symbol_queried": sym,
+            "fundamental_score": score,
+            "assessment": assessment,
+            "metrics_count": available_count,
+            "metrics": rounded_metrics,
+        }
+
+    return None
+
+
 def _fetch_analyst_ratings(ticker: str) -> dict | None:
     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not api_key:
@@ -423,6 +629,7 @@ def _build_llm_prompt(
     competitors: list[str],
     headlines: list[str],
     ratings_info: dict | None = None,
+    fundamentals_info: dict | None = None,
 ) -> str:
     if quote_info:
         currency = str(quote_info.get("currency") or "USD").upper()
@@ -450,6 +657,11 @@ def _build_llm_prompt(
         if ratings_info and ratings_info.get("total_analysts", 0) > 0
         else "Keine Analysten-Zähler verfügbar"
     )
+    fundamentals_str = (
+        json.dumps(fundamentals_info, ensure_ascii=False)
+        if fundamentals_info and fundamentals_info.get("metrics_count", 0) > 0
+        else "Keine Fundamentalkennzahlen verfügbar"
+    )
 
     return f"""
 Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den Wert sachlich, knapp und ohne Anlageberatung.
@@ -462,19 +674,20 @@ Wert:
 - ISIN: {isin or "-"}
 - Währungskontext: {currency_hint}
 - Kurs- & Spannenkennzahlen (inkl. 52-Wochen-Spanne, Tagesrange & Volumen falls vorhanden): {quote_str}
+- Fundamentalkennzahlen & Fundamental-Score: {fundamentals_str}
 - Analysten-Zähler (Buy/Hold/Sell): {ratings_str}
 - Wettbewerber-Hinweise: {peers_str}
 - Aktuelle Schlagzeilen: {news_str}
 
 Bewerte jede Dimension von 0.0 bis 10.0 (Dezimalzahl mit Punkt, z. B. 7.5) mit jeweils 1-2 kurzen Sätzen auf Deutsch:
 1. history_and_price: Kursverlauf, Einordnung in die 52-Wochen-Spanne (Abstand zu Hoch/Tief sowie Position in %), Tagesschwankung/Volumen, Trend und aktueller Kurs.
-2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur, Margen und ggf. Währungseffekte.
+2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur, Margen, Fundamentalkennzahlen (z. B. KGV/ROE/Verschuldung) und ggf. Währungseffekte.
 3. politics_and_regulation: Politik, Regularien, Zölle und Gesetze.
 4. competition_and_moat: Wettbewerb, Burggraben und relevante Konkurrenten.
 
 Wichtige Regeln:
 - Der overall_score soll dem Durchschnitt deiner vier Dimensions-Scores entsprechen.
-- Erfinde keine konkreten aktuellen Kurse, Zahlen oder News, die nicht in den bereitgestellten Daten stehen.
+- Erfinde keine konkreten aktuellen Kurse, Kennzahlen oder News, die nicht in den bereitgestellten Daten stehen.
 
 JSON-Schema:
 {{
@@ -722,6 +935,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
     competitors = _find_competitor_candidates(clean_ticker, resolved_name)
     headlines = _fetch_recent_news(clean_ticker, limit=5)
     ratings_info = _fetch_analyst_ratings(clean_ticker)
+    fundamentals_info = _fetch_fundamentals(clean_ticker)
     prompt = _build_llm_prompt(
         ticker=clean_ticker,
         company_name=resolved_name,
@@ -731,6 +945,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         competitors=competitors,
         headlines=headlines,
         ratings_info=ratings_info,
+        fundamentals_info=fundamentals_info,
     )
 
     try:
@@ -772,6 +987,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "isin": resolved_isin,
         "quote": quote_info,
         "quote_available": quote_info is not None,
+        "fundamentals": fundamentals_info,
         "analyst_ratings": ratings_info,
         "recent_headlines": headlines,
         "overall_score": overall,
