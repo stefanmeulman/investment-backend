@@ -179,28 +179,28 @@ def _build_llm_prompt(
     peers_str = ", ".join(competitors) if competitors else "Keine direkten Kandidaten aus lokalem Katalog abgeleitet"
 
     return f"""
-Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den folgenden Wert sachlich, nüchtern und ohne Anlageberatung.
-Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt (ohne Markdown-Codeblöcke, ohne zusätzlichen Text davor oder danach).
+Du bist ein strukturierter Finanz- und Marktanalyst. Analysiere den Wert sachlich, knapp und ohne Anlageberatung.
+Antworte AUSSCHLIESSLICH mit einem gültigen JSON-Objekt (ohne Markdown, ohne Zusatztext).
 
-Zielwert:
+Wert:
 - Ticker: {ticker}
 - Name: {company_name or "Unbekannt"}
 - WKN: {wkn or "-"}
 - ISIN: {isin or "-"}
-- Aktuelle Kursdaten: {quote_str}
-- Mögliche Wettbewerber-Kandidaten: {peers_str}
+- Kursdaten: {quote_str}
+- Wettbewerber-Hinweise: {peers_str}
 
-Bewerte jede Dimension von 0.0 bis 10.0 und liefere kompakte, präzise Begründungen auf Deutsch:
-1. history_and_price: Historische Kursentwicklung, Trends, Volatilität und Einordnung aktueller Kursdaten.
-2. economics_and_macro: Makroökonomisches Umfeld (Zinsen, Konjunktur, Währung, Margen/Geschäftsmodell).
-3. politics_and_regulation: Politische Ereignisse, Regularien, Zölle, Gesetze und deren wahrscheinliche Kurswirkung.
-4. competition_and_moat: Wettbewerbsposition, Burggraben (Moat) und Vergleich mit Konkurrenten.
+Bewerte jede Dimension von 0.0 bis 10.0 mit jeweils 1-2 kurzen Sätzen auf Deutsch:
+1. history_and_price: Kursverlauf, Trend, Volatilität und aktueller Kurs.
+2. economics_and_macro: Makroumfeld, Zinsen, Konjunktur und Margen.
+3. politics_and_regulation: Politik, Regularien, Zölle und Gesetze.
+4. competition_and_moat: Wettbewerb, Burggraben und Konkurrenten.
 
-Verwende exakt dieses JSON-Schema:
+JSON-Schema:
 {{
   "overall_score": 0.0,
   "status": "Starkes Profil | Solide / Beobachten | Schwaches Profil",
-  "summary": "Kurzfassung in 2-3 Sätzen",
+  "summary": "Kurzfassung in 1-2 Sätzen",
   "dimensions": {{
     "history_and_price": {{ "score": 0.0, "analysis": "..." }},
     "economics_and_macro": {{ "score": 0.0, "analysis": "..." }},
@@ -208,7 +208,7 @@ Verwende exakt dieses JSON-Schema:
     "competition_and_moat": {{ "score": 0.0, "analysis": "..." }}
   }},
   "competitors": ["Konkurrent 1", "Konkurrent 2"],
-  "key_catalysts": ["Chance/Treiber 1", "Chance/Treiber 2"],
+  "key_catalysts": ["Treiber 1", "Treiber 2"],
   "key_risks": ["Risiko 1", "Risiko 2"],
   "disclaimer": "KI-gestützte Analyse auf Basis bereitgestellter Marktdaten; keine Anlageberatung."
 }}
@@ -234,21 +234,34 @@ def _call_gemini_json(prompt: str) -> dict:
         },
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
+    last_err: Exception | None = None
+    raw_body: dict | None = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw_body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        detail_body = err.read().decode("utf-8", errors="replace")
-        if err.code == 429:
-            raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
-        raise RuntimeError(f"Gemini HTTP {err.code}: {detail_body[:300]}") from err
+    for attempt in range(2):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=75) as resp:
+                raw_body = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as err:
+            detail_body = err.read().decode("utf-8", errors="replace")
+            if err.code == 429:
+                raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
+            raise RuntimeError(f"Gemini HTTP {err.code}: {detail_body[:300]}") from err
+        except Exception as exc:
+            last_err = exc
+            if attempt == 0:
+                time.sleep(1.5)
+                continue
+            raise RuntimeError(f"Gemini-Aufruf nach Retry fehlgeschlagen: {last_err}") from last_err
+
+    if not raw_body:
+        raise RuntimeError("Keine Antwortdaten von Gemini erhalten")
 
     candidates = raw_body.get("candidates") or []
     if not candidates:
