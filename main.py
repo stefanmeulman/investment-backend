@@ -220,11 +220,9 @@ def _call_gemini_json(prompt: str) -> dict:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY ist auf dem Server nicht gesetzt")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(api_key)}"
-    )
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+    fallback_model = "gemini-3.8-flash"
+    models_to_try = [primary_model] if primary_model == fallback_model else [primary_model, fallback_model]
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -234,34 +232,47 @@ def _call_gemini_json(prompt: str) -> dict:
         },
     }
 
-    last_err: Exception | None = None
     raw_body: dict | None = None
+    last_error_msg = "Unbekannter LLM-Fehler"
 
-    for attempt in range(2):
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
+    for model_name in models_to_try:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(model_name)}:generateContent?key={urllib.parse.quote(api_key)}"
         )
-        try:
-            with urllib.request.urlopen(req, timeout=75) as resp:
-                raw_body = json.loads(resp.read().decode("utf-8"))
+
+        for attempt in range(2):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=75) as resp:
+                    raw_body = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as err:
+                detail_body = err.read().decode("utf-8", errors="replace")
+                if err.code == 429:
+                    raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
+                last_error_msg = f"Gemini HTTP {err.code} ({model_name}): {detail_body[:250]}"
+                if err.code == 503 and attempt == 0:
+                    time.sleep(2.0)
+                    continue
+                break
+            except Exception as exc:
+                last_error_msg = f"Netzwerkfehler bei {model_name}: {exc}"
+                if attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                break
+
+        if raw_body is not None:
             break
-        except urllib.error.HTTPError as err:
-            detail_body = err.read().decode("utf-8", errors="replace")
-            if err.code == 429:
-                raise RuntimeError("Gemini Free-Tier Rate-Limit erreicht (HTTP 429). Bitte kurz warten.") from err
-            raise RuntimeError(f"Gemini HTTP {err.code}: {detail_body[:300]}") from err
-        except Exception as exc:
-            last_err = exc
-            if attempt == 0:
-                time.sleep(1.5)
-                continue
-            raise RuntimeError(f"Gemini-Aufruf nach Retry fehlgeschlagen: {last_err}") from last_err
 
     if not raw_body:
-        raise RuntimeError("Keine Antwortdaten von Gemini erhalten")
+        raise RuntimeError(last_error_msg)
 
     candidates = raw_body.get("candidates") or []
     if not candidates:
