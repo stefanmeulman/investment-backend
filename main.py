@@ -17,10 +17,14 @@ app = FastAPI(title="Investment Score API")
 
 DATA_FILE = Path(__file__).parent / "stocks_tr.json"
 QUOTE_CACHE_TTL_SECONDS = 60
+HISTORY_CACHE_TTL_SECONDS = 120
 ANALYSIS_CACHE_TTL_SECONDS = 60 * 60 * 12  # 12 Stunden
 
 _quote_cache: dict[str, tuple[float, dict]] = {}
 _quote_cache_lock = threading.Lock()
+
+_history_cache: dict[str, tuple[float, dict]] = {}
+_history_cache_lock = threading.Lock()
 
 _analysis_cache: dict[str, tuple[float, dict]] = {}
 _analysis_cache_lock = threading.Lock()
@@ -41,6 +45,7 @@ PEER_GROUPS: dict[str, list[str]] = {
     "VOW3.DE": ["BMW (BMW.DE)", "Mercedes-Benz (MBG.DE)", "Tesla (TSLA)", "Stellantis"],
     "BMW.DE": ["Mercedes-Benz (MBG.DE)", "Volkswagen (VOW3.DE)", "Tesla (TSLA)"],
     "MBG.DE": ["BMW (BMW.DE)", "Volkswagen (VOW3.DE)", "Tesla (TSLA)"],
+    "SAP": ["Microsoft (MSFT)", "Oracle (ORCL)", "Salesforce (CRM)", "ServiceNow (NOW)"],
     "SAP.DE": ["Microsoft (MSFT)", "Oracle (ORCL)", "Salesforce (CRM)", "ServiceNow (NOW)"],
     "SIE.DE": ["ABB", "Schneider Electric", "Honeywell (HON)", "General Electric (GE)"],
     "ALV.DE": ["Munich Re (MUV2.DE)", "AXA", "Zurich Insurance", "Generali"],
@@ -55,6 +60,13 @@ PEER_GROUPS: dict[str, list[str]] = {
     "MA": ["Visa (V)", "American Express (AXP)", "PayPal (PYPL)"],
     "KO": ["PepsiCo (PEP)", "Monster Beverage (MNST)", "Keurig Dr Pepper (KDP)"],
     "PEP": ["Coca-Cola (KO)", "Mondelez (MDLZ)", "Nestlé"],
+}
+
+HISTORY_RANGE_CONFIG: dict[str, tuple[str, str, str]] = {
+    "1d": ("1d", "5m", "1 Tag"),
+    "1w": ("5d", "1h", "Letzte Woche"),
+    "1m": ("1mo", "1d", "Letzter Monat"),
+    "1y": ("1y", "1d", "52 Wochen"),
 }
 
 
@@ -186,13 +198,16 @@ def similarity_score(query_norm: str, stock: dict) -> float:
     return best
 
 
-def _fetch_yahoo_quote(ticker: str) -> dict:
+def _fetch_yahoo_chart_payload(ticker: str, range_param: str, interval_param: str) -> dict:
     clean_ticker = ticker.strip().upper()
     if not clean_ticker:
         raise ValueError("Leerer Ticker")
 
     encoded = urllib.parse.quote(clean_ticker)
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1m&range=1d"
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+        f"?interval={urllib.parse.quote(interval_param)}&range={urllib.parse.quote(range_param)}"
+    )
     req = urllib.request.Request(
         url,
         headers={
@@ -201,7 +216,7 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
         },
     )
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
 
     chart = payload.get("chart", {})
@@ -212,7 +227,14 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     if not results:
         raise ValueError(f"Keine Kursdaten für '{clean_ticker}' gefunden")
 
-    meta = results[0].get("meta") or {}
+    return results[0]
+
+
+def _fetch_yahoo_quote(ticker: str) -> dict:
+    clean_ticker = ticker.strip().upper()
+    chart_res = _fetch_yahoo_chart_payload(clean_ticker, range_param="1d", interval_param="1m")
+
+    meta = chart_res.get("meta") or {}
     price = meta.get("regularMarketPrice")
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     currency = meta.get("currency") or "USD"
@@ -290,6 +312,59 @@ def _fetch_yahoo_quote(ticker: str) -> dict:
     }
 
 
+def _fetch_yahoo_history(ticker: str, requested_range: str) -> dict:
+    clean_ticker = ticker.strip().upper()
+    norm_range = requested_range.strip().lower()
+    if norm_range not in HISTORY_RANGE_CONFIG:
+        raise ValueError("Ungültiger Zeitraum. Erlaubt sind: 1d, 1w, 1m, 1y")
+
+    yf_range, yf_interval, range_label = HISTORY_RANGE_CONFIG[norm_range]
+    chart_res = _fetch_yahoo_chart_payload(clean_ticker, range_param=yf_range, interval_param=yf_interval)
+
+    meta = chart_res.get("meta") or {}
+    currency = str(meta.get("currency") or "USD")
+    timestamps = chart_res.get("timestamp") or []
+    quote_block = ((chart_res.get("indicators") or {}).get("quote") or [{}])[0] or {}
+    closes = quote_block.get("close") or []
+
+    points: list[dict] = []
+    for ts, close_val in zip(timestamps, closes):
+        price_opt = safe_optional_float(close_val)
+        if ts is None or price_opt is None:
+            continue
+        points.append({
+            "timestamp": int(ts),
+            "price": round(price_opt, 4),
+        })
+
+    if not points:
+        raise ValueError(f"Keine Zeitreihendaten für '{clean_ticker}' ({norm_range}) verfügbar")
+
+    prices = [p["price"] for p in points]
+    start_price = prices[0]
+    end_price = prices[-1]
+    period_high = max(prices)
+    period_low = min(prices)
+    change = round(end_price - start_price, 4)
+    change_percent = round(((end_price - start_price) / start_price) * 100.0, 2) if start_price != 0.0 else None
+
+    return {
+        "ticker": clean_ticker,
+        "range": norm_range,
+        "range_label": range_label,
+        "interval": yf_interval,
+        "currency": currency,
+        "start_price": start_price,
+        "end_price": end_price,
+        "change": change,
+        "change_percent": change_percent,
+        "period_high": period_high,
+        "period_low": period_low,
+        "points": points,
+        "cached": False,
+    }
+
+
 def _pick_metric(metrics: dict, keys: list[str]) -> float | None:
     for key in keys:
         if key in metrics:
@@ -306,102 +381,111 @@ def _rate_single_metric(key: str, val: float | None) -> dict:
             "score": None,
             "signal": "none",
             "label": "Keine Daten",
+            "rule": "Keine Kennzahl im Datenfeed vorhanden",
         }
 
     rounded_val = round(val, 2)
 
     if key == "pe_ttm":
+        rule = "KGV <= 12: 9,0 | <= 18: 7,5 | <= 25: 6,0 | <= 35: 4,5 | > 35: 3,0 | <= 0: 2,5"
         if val <= 0.0:
-            return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ / kein Gewinn"}
+            return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ / kein Gewinn", "rule": rule}
         if val <= 12.0:
-            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Günstig bewertet"}
+            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Günstig bewertet", "rule": rule}
         if val <= 18.0:
-            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv"}
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv", "rule": rule}
         if val <= 25.0:
-            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Moderat"}
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Moderat", "rule": rule}
         if val <= 35.0:
-            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Erhöht"}
-        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Sportlich bewertet"}
+            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Erhöht", "rule": rule}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Sportlich bewertet", "rule": rule}
 
     if key == "pb":
+        rule = "KBV <= 1,5: 8,5 | <= 3,5: 7,0 | <= 7,0: 5,5 | <= 12,0: 4,0 | > 12,0: 3,0 | <= 0: 3,0"
         if val <= 0.0:
-            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Negatives Eigenkapital"}
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Negatives Eigenkapital", "rule": rule}
         if val <= 1.5:
-            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig"}
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig", "rule": rule}
         if val <= 3.5:
-            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide"}
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide", "rule": rule}
         if val <= 7.0:
-            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat", "rule": rule}
         if val <= 12.0:
-            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Erhöht"}
-        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch"}
+            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Erhöht", "rule": rule}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch", "rule": rule}
 
     if key == "ps_ttm":
+        rule = "KUV <= 1,5: 8,5 | <= 4,0: 7,0 | <= 8,0: 5,5 | > 8,0: 3,5 | <= 0: 3,5"
         if val <= 0.0:
-            return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Kein Umsatz"}
+            return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Kein Umsatz", "rule": rule}
         if val <= 1.5:
-            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig"}
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Günstig", "rule": rule}
         if val <= 4.0:
-            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide"}
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Solide", "rule": rule}
         if val <= 8.0:
-            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
-        return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Hoch"}
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat", "rule": rule}
+        return {"value": rounded_val, "score": 3.5, "signal": "red", "label": "Hoch", "rule": rule}
 
     if key == "roe_ttm":
+        rule = "ROE >= 25%: 9,0 | >= 15%: 7,5 | >= 8%: 6,0 | >= 0%: 4,5 | < 0%: 2,5"
         if val >= 25.0:
-            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Sehr stark"}
+            return {"value": rounded_val, "score": 9.0, "signal": "green", "label": "Sehr stark", "rule": rule}
         if val >= 15.0:
-            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Gut"}
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Gut", "rule": rule}
         if val >= 8.0:
-            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Durchschnittlich"}
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Durchschnittlich", "rule": rule}
         if val >= 0.0:
-            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Schwach"}
-        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ"}
+            return {"value": rounded_val, "score": 4.5, "signal": "yellow", "label": "Schwach", "rule": rule}
+        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Negativ", "rule": rule}
 
     if key == "net_margin_ttm":
+        rule = "Nettomarge >= 20%: 8,5 | >= 12%: 7,5 | >= 5%: 5,5 | >= 0%: 4,0 | < 0%: 2,5"
         if val >= 20.0:
-            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr hoch"}
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr hoch", "rule": rule}
         if val >= 12.0:
-            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Solide"}
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Solide", "rule": rule}
         if val >= 5.0:
-            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat"}
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Moderat", "rule": rule}
         if val >= 0.0:
-            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Knapp"}
-        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Defizitär"}
+            return {"value": rounded_val, "score": 4.0, "signal": "yellow", "label": "Knapp", "rule": rule}
+        return {"value": rounded_val, "score": 2.5, "signal": "red", "label": "Defizitär", "rule": rule}
 
     if key == "debt_to_equity":
+        rule = "Verschuldung/EK <= 0,4: 8,5 | <= 1,0: 7,0 | <= 2,0: 5,0 | > 2,0: 3,0"
         if val < 0.0:
-            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch"}
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch", "rule": rule}
         norm_de = val / 100.0 if val > 10.0 else val
         if norm_de <= 0.4:
-            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr niedrig"}
+            return {"value": rounded_val, "score": 8.5, "signal": "green", "label": "Sehr niedrig", "rule": rule}
         if norm_de <= 1.0:
-            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Kontrolliert"}
+            return {"value": rounded_val, "score": 7.0, "signal": "green", "label": "Kontrolliert", "rule": rule}
         if norm_de <= 2.0:
-            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Erhöht"}
-        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch verschuldet"}
+            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Erhöht", "rule": rule}
+        return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Hoch verschuldet", "rule": rule}
 
     if key == "current_ratio":
+        rule = "Current Ratio >= 1,5: 8,0 | >= 1,0: 6,5 | < 1,0: 4,0 | <= 0: 3,0"
         if val <= 0.0:
-            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch"}
+            return {"value": rounded_val, "score": 3.0, "signal": "red", "label": "Kritisch", "rule": rule}
         if val >= 1.5:
-            return {"value": rounded_val, "score": 8.0, "signal": "green", "label": "Komfortabel"}
+            return {"value": rounded_val, "score": 8.0, "signal": "green", "label": "Komfortabel", "rule": rule}
         if val >= 1.0:
-            return {"value": rounded_val, "score": 6.5, "signal": "yellow", "label": "Ausreichend"}
-        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Knapp"}
+            return {"value": rounded_val, "score": 6.5, "signal": "yellow", "label": "Ausreichend", "rule": rule}
+        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Knapp", "rule": rule}
 
     if key == "dividend_yield":
+        rule = "Dividende 1,5–6,0%: 7,5 | < 1,5%: 6,0 | <= 8,0%: 5,5 | > 8,0%: 4,0 | 0%: 5,0"
         if val <= 0.0:
-            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Keine Dividende"}
+            return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Keine Dividende", "rule": rule}
         if 1.5 <= val <= 6.0:
-            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv"}
+            return {"value": rounded_val, "score": 7.5, "signal": "green", "label": "Attraktiv", "rule": rule}
         if val < 1.5:
-            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Niedrig"}
+            return {"value": rounded_val, "score": 6.0, "signal": "yellow", "label": "Niedrig", "rule": rule}
         if val <= 8.0:
-            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Hoch"}
-        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Auffällig hoch"}
+            return {"value": rounded_val, "score": 5.5, "signal": "yellow", "label": "Hoch", "rule": rule}
+        return {"value": rounded_val, "score": 4.0, "signal": "red", "label": "Auffällig hoch", "rule": rule}
 
-    return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Neutral"}
+    return {"value": rounded_val, "score": 5.0, "signal": "yellow", "label": "Neutral", "rule": "Standardbewertung 5,0"}
 
 
 def _evaluate_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float | None, str, dict[str, dict], dict[str, int]]:
@@ -500,6 +584,7 @@ def _fetch_fundamentals(ticker: str) -> dict | None:
             "source": "finnhub",
             "symbol_queried": sym,
             "fundamental_score": score,
+            "score_method": "Durchschnitt aller verfügbaren Kennzahlen-Scores (0,0–10,0)",
             "assessment": assessment,
             "metrics_count": available_count,
             "signal_counts": counts,
@@ -759,9 +844,10 @@ def _call_gemini_json(prompt: str) -> dict:
 
     primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
     fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
+    lite_fallback_model = os.getenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
 
     models_to_try: list[str] = []
-    for candidate_model in [primary_model, fallback_model, "gemini-3.5-flash"]:
+    for candidate_model in [primary_model, fallback_model, lite_fallback_model]:
         if candidate_model and candidate_model not in models_to_try:
             models_to_try.append(candidate_model)
 
@@ -775,7 +861,7 @@ def _call_gemini_json(prompt: str) -> dict:
 
     raw_body: dict | None = None
     model_errors: list[str] = []
-    backoff_seconds = [1.5, 3.0]
+    backoff_seconds = [2.0, 4.0]
 
     for model_name in models_to_try:
         url = (
@@ -791,16 +877,16 @@ def _call_gemini_json(prompt: str) -> dict:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=75) as resp:
+                with urllib.request.urlopen(req, timeout=45) as resp:
                     raw_body = json.loads(resp.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as err:
                 detail_body = err.read().decode("utf-8", errors="replace")
                 short_detail = detail_body.replace("\n", " ")[:180]
                 model_errors.append(f"{model_name}: HTTP {err.code} ({short_detail})")
-                if err.code in (400, 404, 429):
+                if err.code in (400, 404):
                     break
-                if err.code == 503 and attempt < len(backoff_seconds) - 1:
+                if err.code in (429, 503) and attempt < len(backoff_seconds) - 1:
                     time.sleep(wait_sec)
                     continue
                 break
@@ -945,6 +1031,44 @@ def get_quote(ticker: str = Query(..., min_length=1, description="Ticker-Symbol,
         _quote_cache[clean_ticker] = (now, quote_data)
 
     return quote_data
+
+
+@app.get("/history")
+def get_history(
+    ticker: str = Query(..., min_length=1, description="Ticker-Symbol, z. B. AAPL oder SAP.DE"),
+    range_period: str = Query("1y", alias="range", description="Zeitraum: 1d, 1w, 1m oder 1y (52 Wochen)"),
+):
+    clean_ticker = ticker.strip().upper()
+    norm_range = range_period.strip().lower()
+    if norm_range not in HISTORY_RANGE_CONFIG:
+        raise HTTPException(status_code=400, detail="Ungültiger Zeitraum. Erlaubt sind: 1d, 1w, 1m, 1y")
+
+    cache_key = f"{clean_ticker}:{norm_range}"
+    now = time.time()
+
+    with _history_cache_lock:
+        cached = _history_cache.get(cache_key)
+        if cached and (now - cached[0]) < HISTORY_CACHE_TTL_SECONDS:
+            data = dict(cached[1])
+            data["cached"] = True
+            return data
+
+    try:
+        history_data = _fetch_yahoo_history(clean_ticker, norm_range)
+    except Exception as exc:
+        with _history_cache_lock:
+            stale = _history_cache.get(cache_key)
+            if stale:
+                fallback = dict(stale[1])
+                fallback["cached"] = True
+                fallback["stale"] = True
+                return fallback
+        raise HTTPException(status_code=502, detail=f"Historienabruf fehlgeschlagen: {exc}") from exc
+
+    with _history_cache_lock:
+        _history_cache[cache_key] = (now, history_data)
+
+    return history_data
 
 
 @app.post("/analyze-stock")
