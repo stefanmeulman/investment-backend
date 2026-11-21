@@ -168,6 +168,7 @@ def similarity_score(query_norm: str, stock: dict) -> float:
         normalize_text(stock.get("isin", "")),
         normalize_text(stock.get("ticker", "")),
         normalize_text(stock.get("name", "")),
+        normalize_text(stock.get("market", "")),
     ]
     best = 0.0
     for field in fields:
@@ -583,7 +584,7 @@ def _fetch_analyst_ratings(ticker: str) -> dict | None:
     return None
 
 
-def _fetch_recent_news(ticker: str, limit: int = 5) -> list[str]:
+def _fetch_recent_news(ticker: str, limit: int = 5) -> list[dict]:
     clean_ticker = ticker.strip().upper()
     if not clean_ticker:
         return []
@@ -605,14 +606,23 @@ def _fetch_recent_news(ticker: str, limit: int = 5) -> list[str]:
     except Exception:
         return []
 
-    headlines: list[str] = []
+    headlines: list[dict] = []
+    seen_titles: set[str] = set()
     for item in root_elem.findall(".//channel/item"):
         title_elem = item.find("title")
         if title_elem is None or not title_elem.text:
             continue
         title = html.unescape(title_elem.text).strip()
-        if title and title not in headlines:
-            headlines.append(title)
+        if not title or title in seen_titles:
+            continue
+        seen_titles.add(title)
+        link_elem = item.find("link")
+        link_url = link_elem.text.strip() if link_elem is not None and link_elem.text else None
+        headlines.append({
+            "title": title,
+            "url": link_url,
+            "source": "Yahoo Finance",
+        })
         if len(headlines) >= limit:
             break
 
@@ -660,7 +670,7 @@ def _build_llm_prompt(
     isin: str,
     quote_info: dict | None,
     competitors: list[str],
-    headlines: list[str],
+    headlines: list[dict],
     ratings_info: dict | None = None,
     fundamentals_info: dict | None = None,
 ) -> str:
@@ -680,9 +690,10 @@ def _build_llm_prompt(
         )
 
     peers_str = ", ".join(competitors) if competitors else "Keine direkten Kandidaten aus lokalem Katalog abgeleitet"
+    headline_titles = [str(h.get("title") or "").strip() for h in headlines if str(h.get("title") or "").strip()]
     news_str = (
-        " | ".join(headlines)
-        if headlines
+        " | ".join(headline_titles)
+        if headline_titles
         else "Keine aktuellen Schlagzeilen abgerufen; stütze dich nur auf bekannte Fakten und Kursdaten."
     )
     ratings_str = (
@@ -750,7 +761,7 @@ def _call_gemini_json(prompt: str) -> dict:
     fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
 
     models_to_try: list[str] = []
-    for candidate_model in [primary_model, fallback_model, "gemini-3.5-flash", "gemini-2.5-flash"]:
+    for candidate_model in [primary_model, fallback_model, "gemini-3.5-flash"]:
         if candidate_model and candidate_model not in models_to_try:
             models_to_try.append(candidate_model)
 
@@ -837,8 +848,8 @@ def root():
 
 @app.get("/search-stocks")
 def search_stocks(
-    q: str = Query(..., min_length=1, description="Suche nach WKN, ISIN, Name oder Ticker"),
-    limit: int = Query(8, ge=1, le=25),
+    q: str = Query(..., min_length=1, description="Suche nach WKN, ISIN, Name, Markt oder Ticker"),
+    limit: int = Query(15, ge=1, le=30),
 ):
     q_clean = q.strip()
     q_norm = normalize_text(q_clean)
@@ -852,7 +863,9 @@ def search_stocks(
         isin = str(stock.get("isin", "")).upper()
         ticker = str(stock.get("ticker", "")).upper()
         name = str(stock.get("name", ""))
+        market = str(stock.get("market", ""))
         name_norm = normalize_text(name)
+        market_norm = normalize_text(market)
 
         if q_upper == wkn or q_upper == isin or q_upper == ticker:
             exact_or_prefix.append((1.0, stock))
@@ -868,6 +881,7 @@ def search_stocks(
             or q_norm in normalize_text(isin)
             or q_norm in normalize_text(ticker)
             or q_norm in name_norm
+            or q_norm in market_norm
         ):
             exact_or_prefix.append((0.78, stock))
         else:
@@ -881,14 +895,14 @@ def search_stocks(
     seen_keys = set()
     matches = []
     for _, s in exact_or_prefix:
-        key = s.get("isin") or s.get("wkn") or s.get("ticker")
+        key = s.get("isin") or s.get("wkn") or f"{s.get('ticker')}:{s.get('name')}"
         if key not in seen_keys:
             seen_keys.add(key)
             matches.append(s)
 
     alt_suggestions = []
     for _, s in suggestions:
-        key = s.get("isin") or s.get("wkn") or s.get("ticker")
+        key = s.get("isin") or s.get("wkn") or f"{s.get('ticker')}:{s.get('name')}"
         if key not in seen_keys:
             seen_keys.add(key)
             alt_suggestions.append(s)
@@ -986,8 +1000,12 @@ def analyze_stock(req_data: DeepAnalysisRequest):
 
     try:
         llm_result = _call_gemini_json(prompt)
+        llm_available = True
+        llm_note = ""
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"LLM-Analyse fehlgeschlagen: {exc}") from exc
+        llm_result = {}
+        llm_available = False
+        llm_note = f"KI-Analyse vorübergehend nicht verfügbar: {exc}"
 
     raw_dims = llm_result.get("dimensions")
     dims = raw_dims if isinstance(raw_dims, dict) else {}
@@ -996,7 +1014,7 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         raw_d = dims.get(key)
         d = raw_d if isinstance(raw_d, dict) else {}
         return {
-            "score": round(clamp_score(safe_float(d.get("score"), 5.0)), 1),
+            "score": round(clamp_score(safe_float(d.get("score"), 5.0)), 1) if llm_available else 0.0,
             "analysis": str(d.get("analysis") or "").strip(),
         }
 
@@ -1007,14 +1025,19 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "competition_and_moat": norm_dim("competition_and_moat"),
     }
 
-    overall = round(sum(v["score"] for v in norm_dims.values()) / 4.0, 2)
-
-    if overall >= 7.5:
-        status = "Starkes Profil (Grün)"
-    elif overall >= 5.0:
-        status = "Solide / Beobachten (Gelb)"
+    if llm_available:
+        overall = round(sum(v["score"] for v in norm_dims.values()) / 4.0, 2)
+        if overall >= 7.5:
+            status = "Starkes Profil (Grün)"
+        elif overall >= 5.0:
+            status = "Solide / Beobachten (Gelb)"
+        else:
+            status = "Schwaches Profil (Rot)"
+        summary_text = str(llm_result.get("summary") or "").strip()
     else:
-        status = "Schwaches Profil (Rot)"
+        overall = 0.0
+        status = "KI vorübergehend nicht verfügbar"
+        summary_text = llm_note
 
     final_payload = {
         "ticker": clean_ticker,
@@ -1028,9 +1051,11 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         "recent_headlines": headlines,
         "overall_score": overall,
         "status": status,
-        "summary": str(llm_result.get("summary") or "").strip(),
+        "llm_available": llm_available,
+        "llm_note": llm_note,
+        "summary": summary_text,
         "dimensions": norm_dims,
-        "competitors": safe_str_list(llm_result.get("competitors"), 6),
+        "competitors": safe_str_list(llm_result.get("competitors"), 6) if llm_available else competitors,
         "key_catalysts": safe_str_list(llm_result.get("key_catalysts"), 5),
         "key_risks": safe_str_list(llm_result.get("key_risks"), 5),
         "cached": False,
@@ -1040,8 +1065,9 @@ def analyze_stock(req_data: DeepAnalysisRequest):
         ).strip(),
     }
 
-    with _analysis_cache_lock:
-        _analysis_cache[cache_key] = (now, final_payload)
+    if llm_available:
+        with _analysis_cache_lock:
+            _analysis_cache[cache_key] = (now, final_payload)
 
     return final_payload
 
