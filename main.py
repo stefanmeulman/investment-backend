@@ -29,6 +29,51 @@ _history_cache_lock = threading.Lock()
 _analysis_cache: dict[str, tuple[float, dict]] = {}
 _analysis_cache_lock = threading.Lock()
 
+ALTERNATIVE_SYMBOLS: dict[str, list[str]] = {
+    "ADS.DE": ["ADDYY", "ADDDF"],
+    "BAYN.DE": ["BAYRY", "BAYZF"],
+    "BAS.DE": ["BASFY"],
+    "BMW.DE": ["BMWYY"],
+    "MBG.DE": ["MBGAF", "MBGYY"],
+    "VOW3.DE": ["VWAGY", "VLKAF"],
+    "SIE.DE": ["SIEGY"],
+    "ENR.DE": ["SMNEY"],
+    "SHL.DE": ["SMMNY"],
+    "ALV.DE": ["ALVRY"],
+    "MUV2.DE": ["MURGY"],
+    "DTE.DE": ["DTEGY"],
+    "EOAN.DE": ["EONGY"],
+    "RWE.DE": ["RWEOY"],
+    "DBK.DE": ["DB"],
+    "CBK.DE": ["CRZBY"],
+    "IFX.DE": ["IFNNY"],
+    "RHM.DE": ["RNMBY"],
+    "DHL.DE": ["DPSGY"],
+    "HEN3.DE": ["HENKY"],
+    "BEI.DE": ["BDRFY"],
+    "MRK.DE": ["MKKGY"],
+    "FRE.DE": ["FSNUY"],
+    "FME.DE": ["FMS"],
+    "VNA.DE": ["VONOY"],
+    "ZAL.DE": ["ZLNDY"],
+    "ASML.AS": ["ASML"],
+    "MC.PA": ["LVMUY"],
+    "OR.PA": ["LRLCY"],
+    "TTE.PA": ["TTE"],
+    "SAN.PA": ["SNY"],
+    "SU.PA": ["SBGSY"],
+    "NESN.SW": ["NSRGY"],
+    "NOVN.SW": ["NVS"],
+    "ROG.SW": ["RHHBY"],
+    "NOVO-B.CO": ["NVO"],
+    "AZN.L": ["AZN"],
+    "SHEL.L": ["SHEL"],
+    "ULVR.L": ["UL"],
+    "HSBA.L": ["HSBC"],
+    "7203.T": ["TM"],
+    "6758.T": ["SONY"],
+}
+
 PEER_GROUPS: dict[str, list[str]] = {
     "AAPL": ["Microsoft (MSFT)", "Alphabet (GOOGL)", "Samsung Electronics", "Sony (SONY)"],
     "MSFT": ["Alphabet (GOOGL)", "Apple (AAPL)", "Oracle (ORCL)", "SAP (SAP.DE)"],
@@ -122,6 +167,12 @@ def safe_float(value: object, default: float = 5.0) -> float:
 def safe_optional_float(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, dict):
+        if "raw" in value:
+            return safe_optional_float(value.get("raw"))
+        if "fmt" in value:
+            return safe_optional_float(value.get("fmt"))
+        return None
     if isinstance(value, (int, float)):
         val = float(value)
         return val if val == val and abs(val) != float("inf") else None
@@ -196,6 +247,20 @@ def similarity_score(query_norm: str, stock: dict) -> float:
                 ratio = max(ratio, SequenceMatcher(None, query_norm, token).ratio())
             best = max(best, ratio * 0.8)
     return best
+
+
+def _symbol_candidates(ticker: str) -> list[str]:
+    clean = ticker.strip().upper()
+    if not clean:
+        return []
+    candidates: list[str] = [clean]
+    for alt in ALTERNATIVE_SYMBOLS.get(clean, []):
+        if alt not in candidates:
+            candidates.append(alt)
+    root = clean.split(".")[0]
+    if root and root not in candidates:
+        candidates.append(root)
+    return candidates
 
 
 def _fetch_yahoo_chart_payload(ticker: str, range_param: str, interval_param: str) -> dict:
@@ -524,73 +589,122 @@ def _evaluate_fundamentals(metrics_map: dict[str, float | None]) -> tuple[float 
     return score, label, ratings, counts
 
 
-def _fetch_fundamentals(ticker: str) -> dict | None:
-    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
-    if not api_key:
+def _build_fundamentals_payload(source: str, symbol_queried: str, extracted: dict[str, float | None]) -> dict | None:
+    available_count = sum(1 for v in extracted.values() if v is not None)
+    if available_count == 0:
         return None
 
+    score, assessment, ratings, counts = _evaluate_fundamentals(extracted)
+    rounded_metrics = {
+        k: (round(v, 2) if v is not None else None)
+        for k, v in extracted.items()
+    }
+
+    return {
+        "source": source,
+        "symbol_queried": symbol_queried,
+        "fundamental_score": score,
+        "score_method": "Durchschnitt aller verfügbaren Kennzahlen-Scores (0,0–10,0)",
+        "assessment": assessment,
+        "metrics_count": available_count,
+        "signal_counts": counts,
+        "metrics": rounded_metrics,
+        "metric_ratings": ratings,
+    }
+
+
+def _fetch_yahoo_fundamentals_fallback(symbol: str) -> dict | None:
+    encoded = urllib.parse.quote(symbol.strip().upper())
+    modules = "defaultKeyStatistics,financialData,summaryDetail"
+    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{encoded}?modules={modules}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    result_list = ((data.get("quoteSummary") or {}).get("result")) or []
+    if not result_list or not isinstance(result_list[0], dict):
+        return None
+
+    block = result_list[0]
+    stats = block.get("defaultKeyStatistics") or {}
+    fin = block.get("financialData") or {}
+    summary = block.get("summaryDetail") or {}
+
+    roe_raw = safe_optional_float(fin.get("returnOnEquity"))
+    margin_raw = safe_optional_float(fin.get("profitMargins"))
+    div_raw = safe_optional_float(summary.get("dividendYield"))
+
+    extracted: dict[str, float | None] = {
+        "pe_ttm": safe_optional_float(summary.get("trailingPE")) or safe_optional_float(stats.get("trailingPE")),
+        "ps_ttm": safe_optional_float(summary.get("priceToSalesTrailing12Months")),
+        "pb": safe_optional_float(stats.get("priceToBook")),
+        "roe_ttm": (roe_raw * 100.0) if roe_raw is not None and abs(roe_raw) <= 2.0 else roe_raw,
+        "net_margin_ttm": (margin_raw * 100.0) if margin_raw is not None and abs(margin_raw) <= 1.5 else margin_raw,
+        "debt_to_equity": safe_optional_float(fin.get("debtToEquity")),
+        "current_ratio": safe_optional_float(fin.get("currentRatio")),
+        "dividend_yield": (div_raw * 100.0) if div_raw is not None and abs(div_raw) <= 0.35 else div_raw,
+    }
+    return _build_fundamentals_payload("yahoo_finance", symbol, extracted)
+
+
+def _fetch_fundamentals(ticker: str) -> dict | None:
     clean_ticker = ticker.strip().upper()
     if not clean_ticker:
         return None
 
-    candidates: list[str] = [clean_ticker]
-    root_ticker = clean_ticker.split(".")[0]
-    if root_ticker and root_ticker not in candidates:
-        candidates.append(root_ticker)
+    candidates = _symbol_candidates(clean_ticker)
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+
+    if api_key:
+        for sym in candidates:
+            encoded_sym = urllib.parse.quote(sym)
+            encoded_key = urllib.parse.quote(api_key)
+            url = f"https://finnhub.io/api/v1/stock/metric?symbol={encoded_sym}&metric=all&token={encoded_key}"
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            raw_metric = data.get("metric")
+            if not isinstance(raw_metric, dict) or not raw_metric:
+                continue
+
+            extracted: dict[str, float | None] = {
+                "pe_ttm": _pick_metric(raw_metric, ["peBasicExclExtraTTM", "peTTM"]),
+                "ps_ttm": _pick_metric(raw_metric, ["psTTM"]),
+                "pb": _pick_metric(raw_metric, ["pbQuarterly", "pbAnnual"]),
+                "roe_ttm": _pick_metric(raw_metric, ["roeTTM", "roeRfy"]),
+                "net_margin_ttm": _pick_metric(raw_metric, ["netProfitMarginTTM", "netProfitMarginAnnual"]),
+                "debt_to_equity": _pick_metric(raw_metric, ["totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual"]),
+                "current_ratio": _pick_metric(raw_metric, ["currentRatioQuarterly", "currentRatioAnnual"]),
+                "dividend_yield": _pick_metric(raw_metric, ["dividendYieldIndicatedAnnual", "currentDividendYieldTTM"]),
+            }
+
+            payload = _build_fundamentals_payload("finnhub", sym, extracted)
+            if payload is not None:
+                return payload
 
     for sym in candidates:
-        encoded_sym = urllib.parse.quote(sym)
-        encoded_key = urllib.parse.quote(api_key)
-        url = f"https://finnhub.io/api/v1/stock/metric?symbol={encoded_sym}&metric=all&token={encoded_key}"
-        req = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            continue
-
-        if not isinstance(data, dict):
-            continue
-
-        raw_metric = data.get("metric")
-        if not isinstance(raw_metric, dict) or not raw_metric:
-            continue
-
-        extracted: dict[str, float | None] = {
-            "pe_ttm": _pick_metric(raw_metric, ["peBasicExclExtraTTM", "peTTM"]),
-            "ps_ttm": _pick_metric(raw_metric, ["psTTM"]),
-            "pb": _pick_metric(raw_metric, ["pbQuarterly", "pbAnnual"]),
-            "roe_ttm": _pick_metric(raw_metric, ["roeTTM", "roeRfy"]),
-            "net_margin_ttm": _pick_metric(raw_metric, ["netProfitMarginTTM", "netProfitMarginAnnual"]),
-            "debt_to_equity": _pick_metric(raw_metric, ["totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual"]),
-            "current_ratio": _pick_metric(raw_metric, ["currentRatioQuarterly", "currentRatioAnnual"]),
-            "dividend_yield": _pick_metric(raw_metric, ["dividendYieldIndicatedAnnual", "currentDividendYieldTTM"]),
-        }
-
-        available_count = sum(1 for v in extracted.values() if v is not None)
-        if available_count == 0:
-            continue
-
-        score, assessment, ratings, counts = _evaluate_fundamentals(extracted)
-        rounded_metrics = {
-            k: (round(v, 2) if v is not None else None)
-            for k, v in extracted.items()
-        }
-
-        return {
-            "source": "finnhub",
-            "symbol_queried": sym,
-            "fundamental_score": score,
-            "score_method": "Durchschnitt aller verfügbaren Kennzahlen-Scores (0,0–10,0)",
-            "assessment": assessment,
-            "metrics_count": available_count,
-            "signal_counts": counts,
-            "metrics": rounded_metrics,
-            "metric_ratings": ratings,
-        }
+        yf_payload = _fetch_yahoo_fundamentals_fallback(sym)
+        if yf_payload is not None:
+            return yf_payload
 
     return None
 
@@ -604,12 +718,7 @@ def _fetch_analyst_ratings(ticker: str) -> dict | None:
     if not clean_ticker:
         return None
 
-    candidates: list[str] = [clean_ticker]
-    root_ticker = clean_ticker.split(".")[0]
-    if root_ticker and root_ticker not in candidates:
-        candidates.append(root_ticker)
-
-    for sym in candidates:
+    for sym in _symbol_candidates(clean_ticker):
         encoded_sym = urllib.parse.quote(sym)
         encoded_key = urllib.parse.quote(api_key)
         url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={encoded_sym}&token={encoded_key}"
